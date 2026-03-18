@@ -19,6 +19,7 @@ async def run_claude(
     permission_mode: Optional[str] = None,
     on_text_chunk: Optional[Callable[[str], None]] = None,
     on_tool_use: Optional[Callable[[str, dict], None]] = None,
+    on_process_start: Optional[Callable[[asyncio.subprocess.Process], None]] = None,
 ) -> tuple[str, Optional[str]]:
     """
     调用 claude CLI 并流式解析输出。
@@ -51,6 +52,12 @@ async def run_claude(
         env=env,
         limit=10 * 1024 * 1024,  # 10MB，防止大响应超出默认 64KB 限制
     )
+
+    if on_process_start:
+        if asyncio.iscoroutinefunction(on_process_start):
+            await on_process_start(proc)
+        else:
+            on_process_start(proc)
 
     proc.stdin.write((message + "\n").encode())
     await proc.stdin.drain()

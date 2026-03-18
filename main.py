@@ -24,6 +24,7 @@ from feishu_client import FeishuClient
 from session_store import SessionStore
 from commands import parse_command, handle_command
 from claude_runner import run_claude
+from run_control import ActiveRun, ActiveRunRegistry, stop_run
 
 # ── 看门狗：定时重启防止 WebSocket 假死 ──────────────────────
 
@@ -59,6 +60,40 @@ store = SessionStore()
 
 # per-user 消息队列锁，保证同一用户的消息串行处理，避免并发创建多个 session
 _user_locks: dict[str, asyncio.Lock] = {}
+_active_runs = ActiveRunRegistry()
+
+
+def _extract_text_content(msg) -> str:
+    if msg.message_type != "text":
+        return ""
+    try:
+        return json.loads(msg.content).get("text", "").strip()
+    except Exception:
+        return ""
+
+
+async def _announce_stopped_run(active_run: ActiveRun):
+    try:
+        await feishu.update_card(active_run.card_msg_id, "⏹ 已停止当前任务")
+    except Exception as exc:
+        print(f"[warn] update stopped card failed: {exc}", flush=True)
+
+
+async def _handle_stop_command(sender_open_id: str) -> str:
+    active_run = _active_runs.get_run(sender_open_id)
+    if active_run is None:
+        return "当前没有正在运行的任务"
+    if active_run.stop_requested:
+        return "正在停止当前任务，请稍候"
+
+    stopped = await stop_run(
+        _active_runs,
+        sender_open_id,
+        on_stopped=_announce_stopped_run,
+    )
+    if not stopped:
+        return "当前没有正在运行的任务"
+    return "已发送停止请求"
 
 
 # ── 核心消息处理（async）─────────────────────────────────────
@@ -73,6 +108,11 @@ async def handle_message_async(event: P2ImMessageReceiveV1):
         return
 
     sender_open_id = event.event.sender.sender_id.open_id
+    parsed = parse_command(_extract_text_content(msg))
+    if parsed and parsed[0] == "stop":
+        reply = await _handle_stop_command(sender_open_id)
+        await feishu.send_card_to_user(sender_open_id, content=reply, loading=False)
+        return
 
     # 获取该用户的队列锁，保证消息串行处理
     if sender_open_id not in _user_locks:
@@ -144,6 +184,8 @@ async def _process_message(sender_open_id: str, msg):
         await feishu.send_text_to_user(sender_open_id, f"❌ 发送消息失败：{e}")
         return
 
+    active_run = _active_runs.start_run(sender_open_id, card_msg_id)
+
     accumulated = ""
     chars_since_push = 0
 
@@ -197,12 +239,20 @@ async def _process_message(sender_open_id: str, msg):
             permission_mode=session.permission_mode,
             on_text_chunk=on_text_chunk,
             on_tool_use=on_tool_use,
+            on_process_start=lambda proc: _active_runs.attach_process(sender_open_id, proc),
         )
         print(f"[run_claude] 完成, session={new_session_id}", flush=True)
     except Exception as e:
+        if active_run.stop_requested:
+            return
         print(f"[error] Claude 运行失败: {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()
         await push(f"❌ Claude 执行出错：{type(e).__name__}: {e}")
+        return
+    finally:
+        _active_runs.clear_run(sender_open_id, active_run)
+
+    if active_run.stop_requested:
         return
 
     # 5. 推送最终内容
