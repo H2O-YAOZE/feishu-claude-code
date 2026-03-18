@@ -475,5 +475,8 @@ def handle_command(
     elif cmd == "usage":
         return _get_usage()
 
+    elif cmd == "stop":
+        return "⏹ /stop 命令在消息队列外处理，如果看到这条说明当前没有运行中的任务。"
+
     else:
         return None  # fallback: 转发给 Claude
