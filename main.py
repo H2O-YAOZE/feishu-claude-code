@@ -1,6 +1,6 @@
 """
 飞书 × Claude Code Bot
-通过飞书 WebSocket 长连接接收私聊消息，调用本机 claude CLI 回复，支持流式卡片输出。
+通过飞书 WebSocket 长连接接收私聊/群聊消息，调用本机 claude CLI 回复，支持流式卡片输出。
 
 启动：python main.py
 """
@@ -57,20 +57,14 @@ lark_client = lark.Client.builder() \
 
 feishu = FeishuClient(lark_client, app_id=config.FEISHU_APP_ID, app_secret=config.FEISHU_APP_SECRET)
 store = SessionStore()
-
-# per-user 消息队列锁，保证同一用户的消息串行处理，避免并发创建多个 session
-_user_locks: dict[str, asyncio.Lock] = {}
 _active_runs = ActiveRunRegistry()
 
+# per-chat 消息队列锁，保证同一群组的消息串行处理，允许不同群组并发处理
+_chat_locks: dict[str, asyncio.Lock] = {}
+_MAX_CHAT_LOCKS = 200  # 防止无界增长
 
-def _extract_text_content(msg) -> str:
-    if msg.message_type != "text":
-        return ""
-    try:
-        return json.loads(msg.content).get("text", "").strip()
-    except Exception:
-        return ""
 
+# ── /stop 命令处理 ───────────────────────────────────────────
 
 async def _announce_stopped_run(active_run: ActiveRun):
     try:
@@ -85,7 +79,6 @@ async def _handle_stop_command(sender_open_id: str) -> str:
         return "当前没有正在运行的任务"
     if active_run.stop_requested:
         return "正在停止当前任务，请稍候"
-
     stopped = await stop_run(
         _active_runs,
         sender_open_id,
@@ -98,39 +91,81 @@ async def _handle_stop_command(sender_open_id: str) -> str:
 
 # ── 核心消息处理（async）─────────────────────────────────────
 
+def extract_chat_info(event: P2ImMessageReceiveV1) -> tuple[str, str, bool]:
+    """
+    Extract user_id, chat_id, and is_group from message event.
+
+    Returns:
+        (user_id, chat_id, is_group)
+        - For private chat: chat_id = user_id
+        - For group chat: chat_id = group's chat_id
+    """
+    sender = event.event.sender
+    user_id = sender.sender_id.open_id
+
+    message = event.event.message
+    chat_type = message.chat_type
+    chat_id_raw = message.chat_id
+
+    is_group = (chat_type == "group")
+
+    if is_group:
+        chat_id = chat_id_raw
+    else:
+        chat_id = user_id
+
+    return user_id, chat_id, is_group
+
+
 async def handle_message_async(event: P2ImMessageReceiveV1):
     """异步处理一条飞书消息"""
     msg = event.event.message
     print(f"[收到消息] type={msg.message_type} chat={msg.chat_type}", flush=True)
 
-    # 只处理私聊消息
-    if msg.chat_type != "p2p":
-        return
+    # Extract chat info (supports both private and group chats)
+    user_id, chat_id, is_group = extract_chat_info(event)
+    print(f"[Chat Info] user={user_id[:8]}... chat={chat_id[:8]}... is_group={is_group}", flush=True)
 
-    sender_open_id = event.event.sender.sender_id.open_id
-    parsed = parse_command(_extract_text_content(msg))
-    if parsed and parsed[0] == "stop":
-        reply = await _handle_stop_command(sender_open_id)
-        await feishu.send_card_to_user(sender_open_id, content=reply, loading=False)
-        return
+    # /stop 命令在锁外处理（不需要排队）
+    if msg.message_type == "text":
+        try:
+            _text = json.loads(msg.content).get("text", "").strip()
+        except Exception:
+            _text = ""
+        if _text.lower() in ("/stop", "@_user_1 /stop") or _text.strip().endswith("/stop"):
+            reply = await _handle_stop_command(user_id)
+            if is_group:
+                await feishu.reply_card(msg.message_id, content=reply, loading=False)
+            else:
+                await feishu.send_card_to_user(user_id, content=reply, loading=False)
+            return
 
-    # 获取该用户的队列锁，保证消息串行处理
-    if sender_open_id not in _user_locks:
-        _user_locks[sender_open_id] = asyncio.Lock()
-    lock = _user_locks[sender_open_id]
+    # 群聊只响应 @机器人 的消息
+    if is_group:
+        mentions = getattr(msg, 'mentions', None) or []
+        if not mentions:
+            return  # 没有 @mention，忽略
+
+    # 获取该群组的队列锁，保证同一群组消息串行处理，不同群组可并发
+    if chat_id not in _chat_locks:
+        # 简单的 LRU 清理：超出上限时清掉所有锁（已释放的锁丢弃无害）
+        if len(_chat_locks) >= _MAX_CHAT_LOCKS:
+            _chat_locks.clear()
+        _chat_locks[chat_id] = asyncio.Lock()
+    lock = _chat_locks[chat_id]
 
     async with lock:
         try:
-            await _process_message(sender_open_id, msg)
+            await _process_message(user_id, chat_id, is_group, msg)
         except Exception as e:
             print(f"[error] 消息处理异常: {type(e).__name__}: {e}", flush=True)
             traceback.print_exc(file=sys.stdout)
             sys.stdout.flush()
 
 
-async def _process_message(sender_open_id: str, msg):
-    """实际处理消息的逻辑，在 per-user lock 保护下执行"""
-    print(f"[处理消息] sender={sender_open_id[:8]}...", flush=True)
+async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
+    """实际处理消息的逻辑，在 per-chat lock 保护下执行"""
+    print(f"[处理消息] user={user_id[:8]}... chat={chat_id[:8]}... is_group={is_group}", flush=True)
     text = ""
     img_path = None
 
@@ -141,6 +176,17 @@ async def _process_message(sender_open_id: str, msg):
             return
         if not text:
             return
+
+        # 群聊：去掉 @mention 占位符
+        if is_group:
+            mentions = getattr(msg, 'mentions', None) or []
+            for mention in mentions:
+                key = getattr(mention, 'key', '')
+                if key:
+                    text = text.replace(key, '').strip()
+            if not text:
+                return
+
         print(f"[文本] {text[:50]}", flush=True)
 
     elif msg.message_type == "image":
@@ -152,7 +198,13 @@ async def _process_message(sender_open_id: str, msg):
             text = f"[用户发送了一张图片，路径：{img_path}，请读取并分析这张图片，直接回复用中文]"
         except Exception as e:
             print(f"[error] 下载图片失败: {e}")
-            await feishu.send_text_to_user(sender_open_id, f"❌ 下载图片失败：{e}")
+            if is_group:
+                try:
+                    await feishu.reply_card(msg.message_id, content=f"❌ 下载图片失败：{e}", loading=False)
+                except Exception:
+                    pass
+            else:
+                await feishu.send_text_to_user(user_id, f"❌ 下载图片失败：{e}")
             return
 
     else:
@@ -162,30 +214,47 @@ async def _process_message(sender_open_id: str, msg):
     parsed = parse_command(text)
     if parsed:
         cmd, args = parsed
-        reply = handle_command(cmd, args, sender_open_id, store)
+        reply = await handle_command(cmd, args, user_id, chat_id, store)
         if reply is not None:
             if cmd == "resume" and not args:
-                await feishu.send_text_to_user(sender_open_id, reply)
+                # /resume 命令特殊处理：发送文本消息
+                if is_group:
+                    await feishu.reply_card(msg.message_id, content=reply, loading=False)
+                else:
+                    await feishu.send_text_to_user(user_id, reply)
             else:
-                await feishu.send_card_to_user(sender_open_id, content=reply, loading=False)
+                if is_group:
+                    await feishu.reply_card(msg.message_id, content=reply, loading=False)
+                else:
+                    await feishu.send_card_to_user(user_id, content=reply, loading=False)
             return
         # reply is None → 不是 bot 命令，当作普通消息（含 /xxx）转发给 Claude
 
     # ── 普通消息 → 调用 Claude ──────────────────────────────
-    session = store.get_current(sender_open_id)
+    session = await store.get_current(user_id, chat_id)
     print(f"[Claude] session={session.session_id} model={session.model}", flush=True)
 
     # 1. 发送"思考中"占位卡片，拿到 message_id
     try:
-        card_msg_id = await feishu.send_card_to_user(sender_open_id, loading=True)
+        if is_group:
+            card_msg_id = await feishu.reply_card(msg.message_id, loading=True)
+        else:
+            card_msg_id = await feishu.send_card_to_user(user_id, loading=True)
         print(f"[卡片] card_msg_id={card_msg_id}", flush=True)
     except Exception as e:
         print(f"[error] 发送占位卡片失败: {e}", flush=True)
-        await feishu.send_text_to_user(sender_open_id, f"❌ 发送消息失败：{e}")
+        if is_group:
+            try:
+                await feishu.reply_card(msg.message_id, content=f"❌ 发送消息失败：{e}", loading=False)
+            except Exception:
+                pass
+        else:
+            await feishu.send_text_to_user(user_id, f"❌ 发送消息失败：{e}")
         return
 
-    active_run = _active_runs.start_run(sender_open_id, card_msg_id)
+    active_run = _active_runs.start_run(user_id, card_msg_id)
 
+    # 2. 流式回调
     accumulated = ""
     chars_since_push = 0
 
@@ -195,7 +264,6 @@ async def _process_message(sender_open_id: str, msg):
         except Exception as push_err:
             print(f"[warn] push 失败: {push_err}", flush=True)
 
-    # 2. 工具调用回调：在卡片顶部显示进度
     async def on_tool_use(name: str, inp: dict):
         nonlocal accumulated, chars_since_push
         # AskUserQuestion: 把问题内容直接作为正文显示
@@ -210,7 +278,6 @@ async def _process_message(sender_open_id: str, msg):
         display = f"{tool_line}\n\n{accumulated}" if accumulated else tool_line
         await push(display)
 
-    # 3. 文本流回调：积累后批量推送
     async def on_text_chunk(chunk: str):
         nonlocal accumulated, chars_since_push
         accumulated += chunk
@@ -219,8 +286,7 @@ async def _process_message(sender_open_id: str, msg):
             await push(accumulated)
             chars_since_push = 0
 
-    # 4. 运行 Claude
-    # 新 session 第一条消息带环境提示
+    # 3. 运行 Claude
     claude_msg = text
     if not session.session_id:
         claude_msg = (
@@ -231,7 +297,7 @@ async def _process_message(sender_open_id: str, msg):
         )
     try:
         print(f"[run_claude] 开始调用...", flush=True)
-        full_text, new_session_id = await run_claude(
+        full_text, new_session_id, used_fresh_session_fallback = await run_claude(
             message=claude_msg,
             session_id=session.session_id,
             model=session.model,
@@ -239,7 +305,7 @@ async def _process_message(sender_open_id: str, msg):
             permission_mode=session.permission_mode,
             on_text_chunk=on_text_chunk,
             on_tool_use=on_tool_use,
-            on_process_start=lambda proc: _active_runs.attach_process(sender_open_id, proc),
+            on_process_start=lambda proc: _active_runs.attach_process(user_id, proc),
         )
         print(f"[run_claude] 完成, session={new_session_id}", flush=True)
     except Exception as e:
@@ -247,21 +313,27 @@ async def _process_message(sender_open_id: str, msg):
             return
         print(f"[error] Claude 运行失败: {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()
-        await push(f"❌ Claude 执行出错：{type(e).__name__}: {e}")
-        return
-    finally:
-        _active_runs.clear_run(sender_open_id, active_run)
-
-    if active_run.stop_requested:
+        try:
+            await feishu.update_card(card_msg_id, f"❌ Claude 执行出错：{type(e).__name__}: {e}")
+        except Exception:
+            pass
         return
 
-    # 5. 推送最终内容
-    final = full_text or accumulated or "（无输出）"
-    await push(final)
+    # 4. 最终更新卡片为完整内容
+    final = full_text or "（无输出）"
+    if used_fresh_session_fallback:
+        final = (
+            "⚠️ 检测到工作目录已变化，旧会话无法继续。"
+            "本次已自动切换到新 session。\n\n" + final
+        )
+    try:
+        await feishu.update_card(card_msg_id, final)
+    except Exception as e:
+        print(f"[error] 更新卡片失败: {e}", flush=True)
 
-    # 6. 更新 session 状态
+    # 5. 更新 session 状态
     if new_session_id:
-        store.on_claude_response(sender_open_id, new_session_id, text)
+        await store.on_claude_response(user_id, chat_id, new_session_id, text)
 
 
 def _format_tool(name: str, inp: dict) -> str:
