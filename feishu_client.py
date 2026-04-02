@@ -190,20 +190,22 @@ class FeishuClient:
             if not resp.success():
                 raise RuntimeError(f"patch 卡片失败: {resp.code} {resp.msg}")
 
-        try:
-            await self._retry_with_backoff(_update, max_retries=3)
-        except Exception as e:
-            print(f"[warn] 更新卡片最终失败: {e}", flush=True)
+        await self._retry_with_backoff(_update, max_retries=3)
 
     async def download_image(self, message_id: str, image_key: str) -> str:
-        """下载飞书图片到临时文件，返回本地路径"""
-        import asyncio
+        """下载飞书图片到临时文件，返回本地路径（不阻塞事件循环）"""
+        return await asyncio.to_thread(
+            self._download_image_sync, message_id, image_key
+        )
+
+    def _download_image_sync(self, message_id: str, image_key: str) -> str:
+        """同步下载逻辑，在线程池中执行"""
         import ssl
         import urllib.request
+        import uuid
 
         ctx = ssl.create_default_context()
 
-        # 获取 tenant_access_token
         token_body = json.dumps({"app_id": self._app_id, "app_secret": self._app_secret}).encode()
         token_req = urllib.request.Request(
             "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
@@ -214,10 +216,9 @@ class FeishuClient:
         with urllib.request.urlopen(token_req, context=ctx, timeout=10) as r:
             token = json.loads(r.read())["tenant_access_token"]
 
-        # 下载图片
         url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{image_key}?type=image"
         img_req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-        tmp_path = os.path.join(tempfile.gettempdir(), f"feishu-img-{int(time.time())}.jpg")
+        tmp_path = os.path.join(tempfile.gettempdir(), f"feishu-img-{uuid.uuid4().hex[:8]}.jpg")
         with urllib.request.urlopen(img_req, context=ctx, timeout=15) as r:
             ct = r.headers.get("Content-Type", "")
             if "png" in ct:
@@ -228,6 +229,59 @@ class FeishuClient:
                 f.write(r.read())
 
         return tmp_path
+
+    async def update_card_with_buttons(self, message_id: str, content: str, buttons: list[dict]):
+        """更新卡片内容并附加操作按钮（Card JSON 2.0: 按钮直接放 elements + behaviors 回调）"""
+        base = json.loads(_card_json(content))
+        for i, btn in enumerate(buttons):
+            base["body"]["elements"].append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": btn["text"]},
+                "type": "primary",
+                "size": "small",
+                "name": f"btn_{i}",
+                "value": btn["value"],
+                "behaviors": [{"type": "callback", "value": btn["value"]}],
+            })
+        card_content = json.dumps(base, ensure_ascii=False)
+
+        async def _update():
+            req = (
+                PatchMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(
+                    PatchMessageRequestBody.builder()
+                    .content(card_content)
+                    .build()
+                )
+                .build()
+            )
+            resp = await self.client.im.v1.message.apatch(req)
+            if not resp.success():
+                raise RuntimeError(f"patch 卡片失败: {resp.code} {resp.msg}")
+
+        await self._retry_with_backoff(_update, max_retries=3)
+
+    async def reply_text(self, message_id: str, text: str) -> str:
+        """回复纯文本消息（触发通知）"""
+        async def _reply():
+            req = (
+                ReplyMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(
+                    ReplyMessageRequestBody.builder()
+                    .msg_type("text")
+                    .content(json.dumps({"text": text}))
+                    .build()
+                )
+                .build()
+            )
+            resp = await self.client.im.v1.message.areply(req)
+            if not resp.success():
+                raise RuntimeError(f"回复文本消息失败: {resp.code} {resp.msg}")
+            return resp.data.message_id
+
+        return await self._retry_with_backoff(_reply, max_retries=2)
 
     async def send_text_to_user(self, open_id: str, text: str) -> str:
         """发送纯文本消息"""

@@ -7,17 +7,22 @@
 
 import asyncio
 import json
+import re
 import sys
 import os
 import threading
 import time
 import traceback
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # 确保项目目录在 sys.path 最前面
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1.model import P2ImMessageReceiveV1
+from lark_oapi.event.callback.model.p2_card_action_trigger import (
+    P2CardActionTrigger, P2CardActionTriggerResponse, CallBackToast,
+)
 
 import bot_config as config
 from feishu_client import FeishuClient
@@ -49,6 +54,8 @@ def _watchdog():
 
 # ── 全局单例 ──────────────────────────────────────────────────
 
+_ws_loop = None  # WebSocket 事件循环引用，供 HTTP 回调线程调度异步任务
+
 lark_client = lark.Client.builder() \
     .app_id(config.FEISHU_APP_ID) \
     .app_secret(config.FEISHU_APP_SECRET) \
@@ -71,6 +78,13 @@ async def _announce_stopped_run(active_run: ActiveRun):
         await feishu.update_card(active_run.card_msg_id, "⏹ 已停止当前任务")
     except Exception as exc:
         print(f"[warn] update stopped card failed: {exc}", flush=True)
+
+
+async def _announce_interrupted(active_run: ActiveRun):
+    try:
+        await feishu.update_card(active_run.card_msg_id, "⏹ 已被新消息打断")
+    except Exception:
+        pass
 
 
 async def _handle_stop_command(sender_open_id: str) -> str:
@@ -146,11 +160,20 @@ async def handle_message_async(event: P2ImMessageReceiveV1):
         if not mentions:
             return  # 没有 @mention，忽略
 
+    # 自动打断：新消息到达时，停止该用户的活跃任务（模拟终端 Escape）
+    active = _active_runs.get_run(user_id)
+    if active and not active.stop_requested:
+        print(f"[打断] 新消息到达，自动停止当前任务", flush=True)
+        await stop_run(_active_runs, user_id, on_stopped=_announce_interrupted)
+
     # 获取该群组的队列锁，保证同一群组消息串行处理，不同群组可并发
     if chat_id not in _chat_locks:
         # 简单的 LRU 清理：超出上限时清掉所有锁（已释放的锁丢弃无害）
         if len(_chat_locks) >= _MAX_CHAT_LOCKS:
-            _chat_locks.clear()
+            # 只清理未持有的锁，避免误杀正在使用的锁导致并发串行保护失效
+            idle = [k for k, v in _chat_locks.items() if not v.locked()]
+            for k in idle[:len(idle) // 2]:
+                del _chat_locks[k]
         _chat_locks[chat_id] = asyncio.Lock()
     lock = _chat_locks[chat_id]
 
@@ -161,6 +184,173 @@ async def handle_message_async(event: P2ImMessageReceiveV1):
             print(f"[error] 消息处理异常: {type(e).__name__}: {e}", flush=True)
             traceback.print_exc(file=sys.stdout)
             sys.stdout.flush()
+
+
+async def _run_and_display(
+    user_id: str, chat_id: str, is_group: bool,
+    text: str, card_msg_id: str, session, notify_msg_id: str,
+):
+    """调用 Claude 并流式展示结果，检测选项时附加按钮。消息处理和按钮回复共用此函数。"""
+    active_run = _active_runs.start_run(user_id, card_msg_id)
+
+    accumulated = ""
+    tool_history: list[str] = []
+    ask_options: list[tuple[str, str]] = []  # AskUserQuestion 解析出的选项
+    plan_exited = False  # Claude 调了 ExitPlanMode
+    last_push_time = 0.0
+    push_failures = 0
+    _PUSH_INTERVAL = 0.4
+    _MAX_STREAM_DISPLAY = 2500
+
+    async def push(content: str):
+        nonlocal push_failures
+        if push_failures >= 3:
+            return
+        try:
+            await feishu.update_card(card_msg_id, content)
+            push_failures = 0
+        except Exception as push_err:
+            push_failures += 1
+            print(f"[warn] push 失败 ({push_failures}/3): {push_err}", flush=True)
+
+    def _build_display() -> str:
+        parts = []
+        if tool_history:
+            parts.append("\n".join(tool_history[-5:]))
+        if accumulated:
+            if parts:
+                parts.append("")
+            d = accumulated
+            if len(d) > _MAX_STREAM_DISPLAY:
+                d = "...\n\n" + d[-_MAX_STREAM_DISPLAY:]
+            parts.append(d)
+        return "\n".join(parts) if parts else "⏳ 思考中..."
+
+    async def on_tool_use(name: str, inp: dict):
+        nonlocal accumulated, last_push_time, plan_exited
+        if name.lower() == "exitplanmode":
+            plan_exited = True
+            return
+        if name.lower() == "enterplanmode":
+            if session.permission_mode != "plan":
+                print(f"[Plan] EnterPlanMode 检测到，切换为 plan", flush=True)
+                await store.set_permission_mode(user_id, chat_id, "plan")
+            return
+        if name.lower() == "enterworktree" and inp:
+            wt_name = inp.get("name", "")
+            if wt_name:
+                print(f"[Worktree] 进入 worktree: {wt_name}", flush=True)
+            return
+        if name.lower() == "exitworktree":
+            print(f"[Worktree] 退出 worktree", flush=True)
+            return
+        if name.lower() == "askuserquestion":
+            question = inp.get("question", inp.get("text", ""))
+            if question:
+                accumulated += f"\n\n❓ **等待回复：**\n{question}"
+                detected = _extract_options(question)
+                if detected:
+                    ask_options.clear()
+                    ask_options.extend(detected)
+                await push(_build_display())
+                return
+        tool_line = _format_tool(name, inp)
+        if inp and tool_history:
+            tool_history[-1] = tool_line
+        else:
+            tool_history.append(tool_line)
+        await push(_build_display())
+        last_push_time = time.time()
+
+    async def on_text_chunk(chunk: str):
+        nonlocal accumulated, last_push_time
+        accumulated += chunk
+        now = time.time()
+        if now - last_push_time >= _PUSH_INTERVAL:
+            await push(_build_display())
+            last_push_time = now
+
+    claude_msg = text
+    try:
+        print(f"[run_claude] 开始调用...", flush=True)
+        full_text, new_session_id, used_fresh_session_fallback = await run_claude(
+            message=claude_msg,
+            session_id=session.session_id,
+            model=session.model,
+            cwd=session.cwd,
+            permission_mode=session.permission_mode,
+            on_text_chunk=on_text_chunk,
+            on_tool_use=on_tool_use,
+            on_process_start=lambda proc: _active_runs.attach_process(user_id, proc),
+        )
+        print(f"[run_claude] 完成, session={new_session_id}", flush=True)
+    except Exception as e:
+        if active_run.stop_requested:
+            return
+        print(f"[error] Claude 运行失败: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        try:
+            await feishu.update_card(card_msg_id, f"❌ Claude 执行出错：{type(e).__name__}: {e}")
+        except Exception:
+            pass
+        return
+    finally:
+        _active_runs.clear_run(user_id, active_run)
+
+    # 最终更新卡片，检测选项时附加按钮
+    # AskUserQuestion 的内容在 accumulated 里，full_text 可能不含，需要兜底
+    final = full_text or accumulated or "（无输出）"
+    if used_fresh_session_fallback:
+        final = (
+            "⚠️ 检测到工作目录已变化，旧会话无法继续。"
+            "本次已自动切换到新 session。\n\n" + final
+        )
+    options = _extract_options(final) or ask_options
+    card_patched = False
+    try:
+        if options:
+            buttons = [
+                {"text": display, "value": {"reply": value, "cid": chat_id}}
+                for display, value in options
+            ]
+            await feishu.update_card_with_buttons(card_msg_id, final, buttons)
+        else:
+            await feishu.update_card(card_msg_id, final)
+        card_patched = True
+    except Exception as e:
+        print(f"[error] 卡片更新失败，回退发文本: {e}", flush=True)
+        try:
+            if is_group and notify_msg_id:
+                await feishu.reply_card(notify_msg_id, content=final, loading=False)
+            else:
+                await feishu.send_text_to_user(user_id, final)
+        except Exception as fallback_err:
+            print(f"[error] 文本回退也失败: {fallback_err}", flush=True)
+
+    if card_patched:
+        try:
+            if is_group and notify_msg_id:
+                await feishu.reply_text(notify_msg_id, "✅")
+            else:
+                await feishu.send_text_to_user(user_id, "✅")
+        except Exception:
+            pass
+
+    if new_session_id:
+        await store.on_claude_response(user_id, chat_id, new_session_id, text)
+
+    # ExitPlanMode: Claude 批准方案后要切到执行模式
+    if plan_exited and session.permission_mode == "plan":
+        print(f"[Plan] ExitPlanMode 检测到，切换为 bypassPermissions", flush=True)
+        await store.set_permission_mode(user_id, chat_id, "bypassPermissions")
+        try:
+            notice = "🚀 已退出规划模式，发送任意消息开始执行。"
+            if is_group and notify_msg_id:
+                await feishu.reply_text(notify_msg_id, notice)
+            else:
+                await feishu.send_text_to_user(user_id, notice)
+        except Exception:
+            pass
 
 
 async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
@@ -214,19 +404,36 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
     parsed = parse_command(text)
     if parsed:
         cmd, args = parsed
+        print(f"[cmd] 执行命令 {cmd}", flush=True)
         reply = await handle_command(cmd, args, user_id, chat_id, store)
+        print(f"[cmd] 命令返回 type={type(reply).__name__}", flush=True)
         if reply is not None:
+            if isinstance(reply, dict):
+                reply_text, reply_buttons = reply["text"], reply.get("buttons", [])
+            else:
+                reply_text, reply_buttons = reply, []
+
             if cmd == "resume" and not args:
-                # /resume 命令特殊处理：发送文本消息
                 if is_group:
-                    await feishu.reply_card(msg.message_id, content=reply, loading=False)
+                    await feishu.reply_card(msg.message_id, content=reply_text, loading=False)
                 else:
-                    await feishu.send_text_to_user(user_id, reply)
+                    await feishu.send_text_to_user(user_id, reply_text)
+            elif reply_buttons:
+                if is_group:
+                    card_id = await feishu.reply_card(msg.message_id, content=reply_text, loading=False)
+                else:
+                    card_id = await feishu.send_card_to_user(user_id, content=reply_text, loading=False)
+                print(f"[按钮] 卡片已发送 card_id={card_id}, 准备添加 {len(reply_buttons)} 个按钮", flush=True)
+                try:
+                    await feishu.update_card_with_buttons(card_id, reply_text, reply_buttons)
+                    print(f"[按钮] 按钮添加成功", flush=True)
+                except Exception as btn_err:
+                    print(f"[按钮] 按钮添加失败: {btn_err}", flush=True)
             else:
                 if is_group:
-                    await feishu.reply_card(msg.message_id, content=reply, loading=False)
+                    await feishu.reply_card(msg.message_id, content=reply_text, loading=False)
                 else:
-                    await feishu.send_card_to_user(user_id, content=reply, loading=False)
+                    await feishu.send_card_to_user(user_id, content=reply_text, loading=False)
             return
         # reply is None → 不是 bot 命令，当作普通消息（含 /xxx）转发给 Claude
 
@@ -252,88 +459,42 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
             await feishu.send_text_to_user(user_id, f"❌ 发送消息失败：{e}")
         return
 
-    active_run = _active_runs.start_run(user_id, card_msg_id)
+    await _run_and_display(user_id, chat_id, is_group, text, card_msg_id, session, msg.message_id)
 
-    # 2. 流式回调
-    accumulated = ""
-    chars_since_push = 0
 
-    async def push(content: str):
-        try:
-            await feishu.update_card(card_msg_id, content)
-        except Exception as push_err:
-            print(f"[warn] push 失败: {push_err}", flush=True)
+def _extract_options(text: str) -> list[tuple[str, str]]:
+    """从文本中提取选项，适配 Claude Code 原生输出格式。返回 [(按钮文字, 回复值), ...]"""
+    lines = text.strip().split('\n')
 
-    async def on_tool_use(name: str, inp: dict):
-        nonlocal accumulated, chars_since_push
-        # AskUserQuestion: 把问题内容直接作为正文显示
-        if name.lower() == "askuserquestion":
-            question = inp.get("question", inp.get("text", ""))
-            if question:
-                accumulated += f"\n\n❓ **等待回复：**\n{question}"
-                chars_since_push = 0
-                await push(accumulated)
-                return
-        tool_line = _format_tool(name, inp)
-        display = f"{tool_line}\n\n{accumulated}" if accumulated else tool_line
-        await push(display)
+    # 从末尾向上扫描连续的编号选项
+    option_lines = []
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            if option_lines:
+                break
+            continue
+        # 匹配: 1. xxx / 1) xxx / 1、xxx / a) xxx / A) xxx
+        m = re.match(r'^(\d+|[a-zA-Z])[.）\)、]\s*(.+)', line)
+        if m:
+            option_lines.append((m.group(1), m.group(2).strip()))
+        elif option_lines:
+            break
+        else:
+            break
+    option_lines.reverse()
+    if len(option_lines) >= 2:
+        return [
+            (f"{key}. {desc}" if len(desc) <= 18 else f"{key}. {desc[:16]}..", key)
+            for key, desc in option_lines
+        ]
 
-    async def on_text_chunk(chunk: str):
-        nonlocal accumulated, chars_since_push
-        accumulated += chunk
-        chars_since_push += len(chunk)
-        if chars_since_push >= config.STREAM_CHUNK_SIZE:
-            await push(accumulated)
-            chars_since_push = 0
+    # Y/N 及变体
+    tail = "\n".join(lines[-3:]) if len(lines) >= 3 else text
+    if re.search(r'\by\b.*\bn\b|Y/N|yes.*no|是/否|确认/取消', tail, re.IGNORECASE):
+        return [("Yes", "yes"), ("No", "no")]
 
-    # 3. 运行 Claude
-    claude_msg = text
-    if not session.session_id:
-        claude_msg = (
-            "[环境：用户通过飞书发送消息，无交互式UI。"
-            "当需要用户做选择时，用编号列表呈现选项（1. 2. 3.），"
-            "最后加一个「其他（请说明）」选项，用户回复数字即可。"
-            "简单确认用 Y/N。]\n\n" + text
-        )
-    try:
-        print(f"[run_claude] 开始调用...", flush=True)
-        full_text, new_session_id, used_fresh_session_fallback = await run_claude(
-            message=claude_msg,
-            session_id=session.session_id,
-            model=session.model,
-            cwd=session.cwd,
-            permission_mode=session.permission_mode,
-            on_text_chunk=on_text_chunk,
-            on_tool_use=on_tool_use,
-            on_process_start=lambda proc: _active_runs.attach_process(user_id, proc),
-        )
-        print(f"[run_claude] 完成, session={new_session_id}", flush=True)
-    except Exception as e:
-        if active_run.stop_requested:
-            return
-        print(f"[error] Claude 运行失败: {type(e).__name__}: {e}", flush=True)
-        traceback.print_exc()
-        try:
-            await feishu.update_card(card_msg_id, f"❌ Claude 执行出错：{type(e).__name__}: {e}")
-        except Exception:
-            pass
-        return
-
-    # 4. 最终更新卡片为完整内容
-    final = full_text or "（无输出）"
-    if used_fresh_session_fallback:
-        final = (
-            "⚠️ 检测到工作目录已变化，旧会话无法继续。"
-            "本次已自动切换到新 session。\n\n" + final
-        )
-    try:
-        await feishu.update_card(card_msg_id, final)
-    except Exception as e:
-        print(f"[error] 更新卡片失败: {e}", flush=True)
-
-    # 5. 更新 session 状态
-    if new_session_id:
-        await store.on_claude_response(user_id, chat_id, new_session_id, text)
+    return []
 
 
 def _format_tool(name: str, inp: dict) -> str:
@@ -366,14 +527,210 @@ def _format_tool(name: str, inp: dict) -> str:
 
 # ── 飞书事件回调（同步）→ 调度异步任务 ───────────────────────
 
+# ── 卡片按钮点击处理（选项选择）──────────────────────────────
+
+def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
+    """用户点击卡片按钮：选项回复 or 模式切换"""
+    global _last_event
+    _last_event = time.time()
+
+    event = data.event
+    user_id = event.operator.open_id
+    value = event.action.value or {}
+    action_type = value.get("action", "")
+    chat_id = value.get("cid", user_id)
+    clicked_msg_id = event.context.open_message_id if event.context else None
+
+    # 模式切换按钮
+    if action_type == "set_mode":
+        mode = value.get("mode", "")
+        if mode:
+            asyncio.ensure_future(_handle_set_mode(user_id, chat_id, mode, clicked_msg_id))
+        resp = P2CardActionTriggerResponse()
+        toast = CallBackToast()
+        toast.type = "success"
+        toast.content = f"已切换: {mode}"
+        resp.toast = toast
+        return resp
+
+    # 选项回复按钮（发给 Claude）
+    reply_text = value.get("reply", "")
+    if reply_text:
+        print(f"[按钮] user={user_id[:8]}... reply={reply_text}", flush=True)
+        asyncio.ensure_future(_handle_button_reply(user_id, chat_id, reply_text, clicked_msg_id))
+
+    resp = P2CardActionTriggerResponse()
+    toast = CallBackToast()
+    toast.type = "info"
+    toast.content = f"已发送: {reply_text}"
+    resp.toast = toast
+    return resp
+
+
+async def _handle_set_mode(user_id: str, chat_id: str, mode: str, card_msg_id: str):
+    """卡片按钮切换权限模式"""
+    from commands import VALID_MODES
+    await store.set_permission_mode(user_id, chat_id, mode)
+    desc = VALID_MODES.get(mode, "")
+    print(f"[模式切换] user={user_id[:8]}... mode={mode}", flush=True)
+    if card_msg_id:
+        try:
+            await feishu.update_card(card_msg_id, f"✅ 已切换为 **{mode}**\n{desc}")
+        except Exception:
+            pass
+
+
+async def _handle_button_reply(user_id: str, chat_id: str, text: str, clicked_msg_id: str):
+    """按钮点击 → 走正常的 lock + Claude 流程"""
+    is_group = (chat_id != user_id)
+
+    # 自动打断活跃任务
+    active = _active_runs.get_run(user_id)
+    if active and not active.stop_requested:
+        await stop_run(_active_runs, user_id, on_stopped=_announce_interrupted)
+
+    if chat_id not in _chat_locks:
+        if len(_chat_locks) >= _MAX_CHAT_LOCKS:
+            idle = [k for k, v in _chat_locks.items() if not v.locked()]
+            for k in idle[:len(idle) // 2]:
+                del _chat_locks[k]
+        _chat_locks[chat_id] = asyncio.Lock()
+    lock = _chat_locks[chat_id]
+
+    async with lock:
+        try:
+            session = await store.get_current(user_id, chat_id)
+            try:
+                if is_group and clicked_msg_id:
+                    card_msg_id = await feishu.reply_card(clicked_msg_id, loading=True)
+                else:
+                    card_msg_id = await feishu.send_card_to_user(user_id, loading=True)
+            except Exception as e:
+                print(f"[error] 按钮回复占位卡片失败: {e}", flush=True)
+                return
+            await _run_and_display(
+                user_id, chat_id, is_group, text,
+                card_msg_id, session, clicked_msg_id or "",
+            )
+        except Exception as e:
+            print(f"[error] 按钮回复处理异常: {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc(file=sys.stdout)
+
+
+# ── 飞书事件回调（同步）→ 调度异步任务 ───────────────────────
+
 def on_message_receive(data: P2ImMessageReceiveV1) -> None:
     """
     飞书 SDK 同步回调。
     ws.Client 内部运行 asyncio loop，此处用 ensure_future 调度异步任务。
     """
-    global _last_event
+    global _last_event, _ws_loop
     _last_event = time.time()
+    if _ws_loop is None:
+        _ws_loop = asyncio.get_event_loop()
     asyncio.ensure_future(handle_message_async(data))
+
+
+# ── 卡片回调 HTTP 服务（配合 ngrok 暴露给飞书）────────────────
+
+class _CardCallbackHandler(BaseHTTPRequestHandler):
+    """处理飞书卡片按钮点击的 HTTP 回调"""
+
+    def do_POST(self):
+        length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(length)
+        try:
+            data = json.loads(body)
+        except Exception:
+            self._respond(400, {"error": "bad json"})
+            return
+
+        # 飞书 URL 验证
+        if data.get("type") == "url_verification":
+            self._respond(200, {"challenge": data.get("challenge", "")})
+            return
+
+        event = data.get("event", {})
+        operator = event.get("operator", {})
+        user_id = operator.get("open_id", "")
+        action = event.get("action", {})
+        value = action.get("value", {})
+        context = event.get("context", {})
+
+        action_type = value.get("action", "")
+        chat_id = value.get("cid", user_id)
+        clicked_msg_id = context.get("open_message_id", "")
+
+        print(f"[HTTP回调] user={user_id[:8]}... action={action_type or 'reply'}", flush=True)
+
+        if action_type == "set_mode":
+            mode = value.get("mode", "")
+            if mode and _ws_loop:
+                asyncio.run_coroutine_threadsafe(
+                    _handle_set_mode(user_id, chat_id, mode, clicked_msg_id),
+                    _ws_loop,
+                )
+            self._respond(200, {"toast": {"type": "success", "content": f"已切换: {mode}"}})
+        else:
+            reply_text = value.get("reply", "")
+            if reply_text and _ws_loop:
+                asyncio.run_coroutine_threadsafe(
+                    _handle_button_reply(user_id, chat_id, reply_text, clicked_msg_id),
+                    _ws_loop,
+                )
+            self._respond(200, {"toast": {"type": "info", "content": f"已发送: {reply_text}"}})
+
+    def _respond(self, code, data):
+        body = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass  # 静默 HTTP 日志
+
+
+def _start_callback_server(port):
+    server = HTTPServer(('0.0.0.0', port), _CardCallbackHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+
+
+def _start_ngrok(port):
+    """启动 ngrok 隧道，返回公网 URL"""
+    import subprocess
+    import urllib.request
+
+    # 先检查已有的 ngrok 隧道
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=2) as r:
+            tunnels = json.loads(r.read())
+            for t in tunnels.get("tunnels", []):
+                if t.get("proto") == "https":
+                    return t["public_url"]
+    except Exception:
+        pass
+
+    # 启动新 ngrok（有固定域名就用，保证重启后 URL 不变）
+    try:
+        ngrok_domain = os.environ.get("NGROK_DOMAIN", "")
+        ngrok_cmd = ["ngrok", "http", "--url", ngrok_domain, str(port)] if ngrok_domain else ["ngrok", "http", str(port)]
+        subprocess.Popen(
+            ngrok_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(3)
+        with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=5) as r:
+            tunnels = json.loads(r.read())
+            for t in tunnels.get("tunnels", []):
+                if t.get("proto") == "https":
+                    return t["public_url"]
+    except Exception as e:
+        print(f"   [warn] ngrok 启动失败: {e}", flush=True)
+    return None
 
 
 # ── 启动 ──────────────────────────────────────────────────────
@@ -385,8 +742,18 @@ def main():
     print(f"   默认工作目录: {config.DEFAULT_CWD}")
     print(f"   权限模式    : {config.PERMISSION_MODE}")
 
+    # 卡片回调 HTTP 服务 + ngrok 隧道
+    cb_port = config.CALLBACK_PORT
+    _start_callback_server(cb_port)
+    ngrok_url = _start_ngrok(cb_port)
+    if ngrok_url:
+        print(f"   卡片回调    : {ngrok_url}/callback")
+    else:
+        print(f"   卡片回调    : http://localhost:{cb_port}/callback (需启动 ngrok)")
+
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message_receive) \
+        .register_p2_card_action_trigger(on_card_action) \
         .build()
 
     ws_client = lark.ws.Client(

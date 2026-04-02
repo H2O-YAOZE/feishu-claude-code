@@ -307,10 +307,23 @@ class SessionStore:
         os.replace(tmp, SESSIONS_FILE)  # 原子操作，崩溃时不会截断原文件
 
     async def _save_async(self):
-        """异步保存，使用锁保护并发写入"""
+        """异步保存，使用锁保护并发写入（原子写入）"""
         async with self._save_lock:
-            with open(SESSIONS_FILE, "w") as f:
+            tmp = SESSIONS_FILE + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump(self._data, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, SESSIONS_FILE)
+
+    async def _bg_generate_summary(self, user_id: str, session_id: str):
+        """后台生成会话摘要，不阻塞消息流"""
+        try:
+            summary = await asyncio.to_thread(generate_summary, session_id)
+            if summary:
+                self._data.setdefault(user_id, {}).setdefault("summaries", {})[session_id] = summary
+                await asyncio.to_thread(_write_custom_title, session_id, summary)
+                await self._save_async()
+        except Exception:
+            pass
 
     def _dedup_all_histories(self):
         """启动时清理所有用户 history 中的重复 session_id"""
@@ -429,16 +442,10 @@ class SessionStore:
             })
             chat_data["history"] = chat_data["history"][-20:]
             cur["started_at"] = datetime.now().isoformat()
-            # 为归档的 session 生成摘要（best-effort）
+            # 异步生成摘要，不阻塞消息流
             summaries = self._data[user_id].get("summaries", {})
             if not summaries.get(old_id):
-                try:
-                    summary = generate_summary(old_id)
-                    if summary:
-                        self._data[user_id].setdefault("summaries", {})[old_id] = summary
-                        _write_custom_title(old_id, summary)
-                except Exception:
-                    pass
+                asyncio.create_task(self._bg_generate_summary(user_id, old_id))
 
         cur["session_id"] = new_session_id
         if not cur.get("preview"):
@@ -462,17 +469,11 @@ class SessionStore:
             })
             chat_data["history"] = chat_data["history"][-20:]
 
-            # Get summary: prefer cached, otherwise generate
+            # 摘要：有缓存就用，没有就后台生成（不阻塞 /new 响应）
             summaries = self._data[user_id].get("summaries", {})
             old_title = summaries.get(old_id, "")
             if not old_title:
-                try:
-                    old_title = generate_summary(old_id)
-                    if old_title:
-                        self._data[user_id].setdefault("summaries", {})[old_id] = old_title
-                        _write_custom_title(old_id, old_title)
-                except Exception:
-                    old_title = ""
+                asyncio.create_task(self._bg_generate_summary(user_id, old_id))
 
         # Create new session
         chat_data["current"] = {
@@ -544,10 +545,10 @@ class SessionStore:
             old_title = summaries.get(old_id, "")
             if not old_title:
                 try:
-                    old_title = generate_summary(old_id)
+                    old_title = await asyncio.to_thread(generate_summary, old_id)
                     if old_title:
                         self._data[user_id].setdefault("summaries", {})[old_id] = old_title
-                        _write_custom_title(old_id, old_title)
+                        await asyncio.to_thread(_write_custom_title, old_id, old_title)
                 except Exception:
                     old_title = ""
 

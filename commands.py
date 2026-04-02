@@ -3,6 +3,7 @@
 返回要发送给用户的回复文本。
 """
 
+import asyncio
 import getpass
 import json
 import os
@@ -90,12 +91,13 @@ BOT_COMMANDS = {
 }
 
 
-async def _build_session_list(user_id: str, chat_id: str, store: SessionStore) -> list[dict]:
+async def _build_session_list(user_id: str, chat_id: str, store: SessionStore, cli_all: list[dict] | None = None) -> list[dict]:
     """构建合并、去重、排序后的 session 列表（不含当前 session）。
     /resume 列表展示和 /resume N 选择都用这一个函数，保证索引一致。"""
     cur_sid = (await store.get_current_raw(user_id, chat_id)).get("session_id")
 
-    cli_all = scan_cli_sessions(30)
+    if cli_all is None:
+        cli_all = scan_cli_sessions(30)
     cli_preview_map = {s["session_id"]: s for s in cli_all}
 
     feishu_sessions = [
@@ -137,7 +139,7 @@ async def _format_session_list(user_id: str, chat_id: str, store: SessionStore) 
     cli_all = scan_cli_sessions(30)
     cli_preview_map = {s["session_id"]: s for s in cli_all}
 
-    all_sessions = await _build_session_list(user_id, chat_id, store)
+    all_sessions = await _build_session_list(user_id, chat_id, store, cli_all=cli_all)
 
     def _fmt_time(raw: str) -> str:
         t = raw[:16].replace("T", " ")
@@ -165,13 +167,15 @@ async def _format_session_list(user_id: str, chat_id: str, store: SessionStore) 
     if missing:
         token = _get_api_token()
         if token:
+            # 并行生成摘要，不逐个阻塞
+            tasks = [asyncio.to_thread(generate_summary, sid, token) for sid in missing[:5]]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
             new_summaries = {}
-            for sid in missing[:5]:
-                s = generate_summary(sid, token=token)
-                if s:
-                    new_summaries[sid] = s
-                    summaries[sid] = s
-                    _write_custom_title(sid, s)
+            for sid, result in zip(missing[:5], results):
+                if isinstance(result, str) and result:
+                    new_summaries[sid] = result
+                    summaries[sid] = result
+                    _write_custom_title(sid, result)
             if new_summaries:
                 await store.batch_set_summaries(user_id, new_summaries)
 
@@ -552,10 +556,33 @@ async def handle_command(
         return HELP_TEXT
 
     elif cmd in ("new", "clear"):
+        # /new [mode] — 开新 session，可选指定模式
+        new_mode = None
+        if args:
+            alias = MODE_ALIASES.get(args.lower(), args)
+            if alias in VALID_MODES:
+                new_mode = alias
+
         old_title = await store.new_session(user_id, chat_id)
+        if new_mode:
+            await store.set_permission_mode(user_id, chat_id, new_mode)
+
+        cur = await store.get_current(user_id, chat_id)
+        parts = []
         if old_title:
-            return f"✅ 已开始新 session。\n上个会话：「{old_title}」"
-        return "✅ 已开始新 session，之前的对话历史已清除。"
+            parts.append(f"✅ 已开始新 session。\n上个会话：「{old_title}」")
+        else:
+            parts.append("✅ 已开始新 session。")
+        parts.append(f"当前模式：**{cur.permission_mode}**")
+        return {
+            "text": "\n".join(parts),
+            "buttons": [
+                {"text": "📋 规划", "value": {"action": "set_mode", "mode": "plan", "cid": chat_id}},
+                {"text": "✏️ 接受编辑", "value": {"action": "set_mode", "mode": "acceptEdits", "cid": chat_id}},
+                {"text": "🚀 全自动", "value": {"action": "set_mode", "mode": "bypassPermissions", "cid": chat_id}},
+                {"text": "🔒 需确认", "value": {"action": "set_mode", "mode": "default", "cid": chat_id}},
+            ],
+        }
 
     elif cmd == "resume":
         if not args:
