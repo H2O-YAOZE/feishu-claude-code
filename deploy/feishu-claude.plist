@@ -3,39 +3,40 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.feishu-claude.bot</string>
+    <string>com.zara.feishu-claude</string>
 
     <key>ProgramArguments</key>
     <array>
-        <!-- 替换为你的 Python 路径，推荐用 venv 里的 -->
-        <string>/path/to/feishu-claude/.venv/bin/python</string>
-        <string>/path/to/feishu-claude/main.py</string>
+        <string>/usr/local/bin/python3</string>
+        <string>-u</string>
+        <string>/Users/bytedance/Documents/Claude code projects/feishu-claude-code/main.py</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/path/to/feishu-claude</string>
+    <string>/Users/bytedance/Documents/Claude code projects/feishu-claude-code</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/bytedance/.npm-global/bin:/Users/bytedance/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/bytedance</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
 
     <key>RunAtLoad</key>
     <true/>
 
     <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
+    <true/>
 
     <key>ThrottleInterval</key>
     <integer>10</integer>
 
     <key>StandardOutPath</key>
-    <string>/tmp/feishu-claude.log</string>
+    <string>/Users/bytedance/Documents/Claude code projects/feishu-claude-code/stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/feishu-claude.log</string>
-
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
-    </dict>
+    <string>/Users/bytedance/Documents/Claude code projects/feishu-claude-code/stderr.log</string>
 </dict>
 </plist>

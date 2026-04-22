@@ -10,7 +10,7 @@ from typing import Callable, Optional
 
 from bot_config import PERMISSION_MODE, CLAUDE_CLI
 
-IDLE_TIMEOUT = 300  # 5 分钟无任何输出视为挂死
+IDLE_TIMEOUT = 900  # 15 分钟无任何输出视为挂死
 
 
 def _extract_text_content(value) -> str:
@@ -59,6 +59,7 @@ async def run_claude(
             "--output-format", "stream-json",
             "--verbose",
             "--include-partial-messages",
+            "--dangerously-skip-permissions",
             "--permission-mode", permission_mode or PERMISSION_MODE,
         ]
         if active_session_id:
