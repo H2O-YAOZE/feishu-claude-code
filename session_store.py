@@ -374,6 +374,38 @@ class SessionStore:
                 changed = True
         return changed
 
+    def _make_initial_chat_data(self, user: dict, chat_key: str) -> dict:
+        # 普通群线程（chat_key 形如 `oc_xxx:om_yyy`）首次出现时，
+        # 继承父聊当前 session（sticky fallback），避免用户点"回复"意外开空白会话。
+        # 话题群话题（`oc_xxx:omt_yyy`）不继承：话题是用户主动创建的。
+        if ":" in chat_key:
+            parent_key, suffix = chat_key.split(":", 1)
+            if suffix.startswith("om_"):
+                parent_data = user.get(parent_key)
+                if parent_data and parent_data.get("current", {}).get("session_id"):
+                    parent_cur = parent_data["current"]
+                    print(
+                        f"[session inherit] thread ...{chat_key[-24:]} ← "
+                        f"parent session {parent_cur['session_id'][:8]}",
+                        flush=True,
+                    )
+                    return {
+                        "current": {
+                            "session_id": parent_cur.get("session_id"),
+                            "model": parent_cur.get("model", DEFAULT_MODEL),
+                            "cwd": parent_cur.get("cwd", DEFAULT_CWD),
+                            "permission_mode": parent_cur.get("permission_mode", PERMISSION_MODE),
+                            "started_at": datetime.now().isoformat(),
+                            "preview": "",
+                            "workspace": parent_cur.get("workspace", ""),
+                        },
+                        "history": [],
+                    }
+        return {
+            "current": self._default_current(),
+            "history": [],
+        }
+
     async def _ensure_chat_data(self, user_id: str, chat_id: str) -> dict:
         user = self._user(user_id)
         chat_key = self._normalize_chat_key(user_id, chat_id)
@@ -387,10 +419,7 @@ class SessionStore:
                     "history": user.pop("history", []),
                 }
             else:
-                user[chat_key] = {
-                    "current": self._default_current(),
-                    "history": [],
-                }
+                user[chat_key] = self._make_initial_chat_data(user, chat_key)
             changed = True
 
         chat_data = user[chat_key]
