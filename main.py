@@ -245,8 +245,10 @@ _FEISHU_DOC_URL_PATTERN = re.compile(
 )
 
 
-async def _resolve_feishu_doc_urls(text: str) -> str:
-    """检测文本中的飞书文档链接，通过 lark-cli（用户 token）获取内容并附在文本末尾。"""
+async def _resolve_feishu_doc_urls(text: str, is_group: bool = False) -> str:
+    """检测文本中的飞书文档链接，通过 lark-cli（用户 token）获取内容并附在文本末尾。群聊不自动读。"""
+    if is_group:
+        return text
     urls = _FEISHU_DOC_URL_PATTERN.findall(text)
     if not urls:
         return text
@@ -636,7 +638,7 @@ async def _process_message_cli(user_id, chat_id, is_group, msg_type, content, me
 
     # ── 飞书文档链接预解析 → 用 lark-cli 取内容嵌入上下文 ─────
     if text:
-        text = await _resolve_feishu_doc_urls(text)
+        text = await _resolve_feishu_doc_urls(text, is_group=is_group)
 
     # ── 斜杠命令 ──────────────────────────────────────────────
     parsed = parse_command(text)
