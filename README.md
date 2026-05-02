@@ -90,6 +90,9 @@
    - `im:message` — 获取与发送消息
    - `im:message:send_as_bot` — 以应用身份发消息
    - `im:resource` — 获取消息中资源文件
+   - `docx:document` — 读写云文档
+   - `docx:document:write_only` — 创建和修改文档（文档自动生成功能必需）
+   - `drive:file:upload` — 上传文件
 4. 事件与回调 → 使用长连接接收事件 → 添加 `im.message.receive_v1`
 5. 凭证与基础信息 → 复制 App ID 和 App Secret
 6. 版本管理与发布 → 创建版本 → 管理员审核通过
@@ -113,7 +116,7 @@ cp .env.example .env
 ```bash
 npm install -g @larksuite/cli
 lark-cli config init
-lark-cli auth login   # 浏览器授权，获取用户 token
+lark-cli auth login --scope "docx:document:write_only drive:file:upload"
 ```
 
 ### 4. 启动
