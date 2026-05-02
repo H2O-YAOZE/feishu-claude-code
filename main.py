@@ -630,62 +630,6 @@ async def _process_message_cli(user_id, chat_id, is_group, msg_type, content, me
             print(f"[{label}] 下载异常: {e}", flush=True)
             text = f"[用户发送了文件「{file_name}」(file_key={file_key})，但下载异常：{e}]"
 
-    elif msg_type == "media":
-        # 文件/文档附件：提取 file_key 并尝试下载/导出
-        if isinstance(content, str):
-            try:
-                content = json.loads(content)
-            except Exception:
-                pass
-        file_key = content.get("file_key", "") if isinstance(content, dict) else ""
-        file_name = content.get("file_name", "") if isinstance(content, dict) else ""
-        image_key = content.get("image_key", "") if isinstance(content, dict) else ""
-
-        if image_key:
-            try:
-                img_path = await feishu.download_image(message_id, image_key)
-                text = f"[用户发送了一张图片，路径：{img_path}，请读取并分析这张图片，直接回复用中文]"
-            except Exception as e:
-                print(f"[error] 媒体图片下载失败: {e}", flush=True)
-                text = f"[用户发送了一张图片但下载失败: {e}]"
-        elif file_key and file_name:
-            print(f"[媒体] file_key={file_key} file_name={file_name}", flush=True)
-            lark_cli = shutil.which("lark-cli") or "lark-cli"
-            doc_content = ""
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    lark_cli, "docs", "+fetch",
-                    "--doc", file_key,
-                    "--as", "user",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                stdout, _ = await proc.communicate()
-                if proc.returncode == 0 and stdout:
-                    data = json.loads(stdout.decode())
-                    raw_content = data.get("data", data)
-                    title = raw_content.get("title", "") if isinstance(raw_content, dict) else ""
-                    body = raw_content.get("content", "") if isinstance(raw_content, dict) else str(raw_content)
-                    doc_content = body
-                    if title:
-                        text = f"[用户分享了文档《{title}》，以下是文档内容：]\n{doc_content}"
-                    else:
-                        text = f"[用户分享了文档，以下是文档内容：]\n{doc_content}"
-            except Exception as e:
-                print(f"[媒体] docs fetch 失败: {e}", flush=True)
-
-            if not doc_content:
-                try:
-                    text = f"[用户分享了文件「{file_name}」，请使用 lark-cli drive +export --token {file_key} --doc-type docx --file-extension markdown 导出后读取]"
-                except Exception as e:
-                    print(f"[媒体] 处理失败: {e}", flush=True)
-                    text = f"[用户分享了文件「{file_name}」(file_key={file_key})]"
-        elif file_key:
-            text = f"[用户分享了一个文件 (file_key={file_key})]"
-        else:
-            print(f"[跳过] media 消息无可用 file_key/image_key", flush=True)
-            return
-
     else:
         print(f"[跳过] 不支持的消息类型: {msg_type}", flush=True)
         return

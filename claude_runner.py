@@ -59,9 +59,12 @@ async def run_claude(
             "--output-format", "stream-json",
             "--verbose",
             "--include-partial-messages",
-            "--dangerously-skip-permissions",
-            "--permission-mode", permission_mode or PERMISSION_MODE,
         ]
+        mode = permission_mode or PERMISSION_MODE
+        if mode == "plan":
+            cmd += ["--permission-mode", "plan"]
+        else:
+            cmd += ["--dangerously-skip-permissions", "--permission-mode", "bypassPermissions"]
         if active_session_id:
             cmd += ["--resume", active_session_id]
         if model:
