@@ -8,14 +8,16 @@
 
 import asyncio
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
-import os
+import tempfile
 import threading
 import time
 import traceback
+import uuid
 
 # 确保项目目录在 sys.path 最前面
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -234,6 +236,62 @@ async def handle_message_from_cli(evt: dict):
             sys.stdout.flush()
 
 
+# ── 飞书文档链接解析 ───────────────────────────────────────────
+_FEISHU_DOC_URL_PATTERN = re.compile(
+    r'https?://[a-zA-Z0-9.-]*feishu\.cn/'
+    r'(docx|wiki|docs|sheets|base|mindnotes|minutes|file)/'
+    r'[a-zA-Z0-9_-]+',
+    re.IGNORECASE
+)
+
+
+async def _resolve_feishu_doc_urls(text: str) -> str:
+    """检测文本中的飞书文档链接，通过 lark-cli（用户 token）获取内容并附在文本末尾。"""
+    urls = _FEISHU_DOC_URL_PATTERN.findall(text)
+    if not urls:
+        return text
+
+    # 去重
+    seen = set()
+    unique_urls = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            unique_urls.append(u)
+
+    lark_cli = shutil.which("lark-cli") or "lark-cli"
+    doc_parts = []
+
+    for full_url in unique_urls[:3]:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                lark_cli, "docs", "+fetch",
+                "--doc", full_url,
+                "--as", "user",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0 and stdout:
+                data = json.loads(stdout.decode())
+                raw_content = data.get("data", data)
+                title = raw_content.get("title", "") if isinstance(raw_content, dict) else ""
+                body = raw_content.get("content", "") if isinstance(raw_content, dict) else str(raw_content)
+                if title and body:
+                    doc_parts.append(f"[文档《{title}》]\n{body}")
+                elif body:
+                    doc_parts.append(f"[文档内容]\n{body}")
+            else:
+                err_msg = stderr.decode()[:200] if stderr else f"exit={proc.returncode}"
+                print(f"[文档解析] 获取失败 {full_url}: {err_msg}", flush=True)
+        except Exception as e:
+            print(f"[文档解析] 异常 {full_url}: {e}", flush=True)
+
+    if doc_parts:
+        return text + "\n\n---\n" + "\n---\n".join(doc_parts)
+    return text
+
+
 async def _process_message_cli(user_id, chat_id, is_group, msg_type, content, message_id, mentions, raw_oc_chat_id=""):
     """处理消息内容"""
     print(f"[处理消息] user={user_id[:8]}... chat={chat_id[:8]}... is_group={is_group}", flush=True)
@@ -326,7 +384,7 @@ async def _process_message_cli(user_id, chat_id, is_group, msg_type, content, me
         # Fallback：如果 post 解析不到文字（比如嵌入式文档卡片），用 API 获取纯文本版本
         if not text:
             try:
-                lark_cli = shutil.which("lark-cli") or "/usr/local/bin/lark-cli"
+                lark_cli = shutil.which("lark-cli") or "lark-cli"
                 api_cid = raw_oc_chat_id or chat_id.split(":")[0]
                 if "oc_" in api_cid:
                     list_args = ["--chat-id", api_cid.split(":")[0], "--as", "bot"]
@@ -372,7 +430,7 @@ async def _process_message_cli(user_id, chat_id, is_group, msg_type, content, me
         # 转发的聊天记录：通过 chat-messages-list 拉取完整内容
         # （messages-mget 对 merge_forward 会超时，chat-messages-list 能正确展开）
         try:
-            lark_cli = shutil.which("lark-cli") or "/usr/local/bin/lark-cli"
+            lark_cli = shutil.which("lark-cli") or "lark-cli"
             api_chat_id = raw_oc_chat_id or chat_id.split(":")[0]
             print(f"[转发debug] raw_oc_chat_id={raw_oc_chat_id} chat_id={chat_id} api_chat_id={api_chat_id} message_id={message_id}", flush=True)
 
@@ -427,9 +485,214 @@ async def _process_message_cli(user_id, chat_id, is_group, msg_type, content, me
             print(f"[error] 处理转发消息失败: {e}", flush=True)
             text = f"[用户转发了一段聊天记录，但无法读取内容: {e}]"
 
+    elif msg_type == "media":
+        # 文件/文档附件：提取 file_key 并尝试下载/导出
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except Exception:
+                pass
+        file_key = content.get("file_key", "") if isinstance(content, dict) else ""
+        file_name = content.get("file_name", "") if isinstance(content, dict) else ""
+        image_key = content.get("image_key", "") if isinstance(content, dict) else ""
+
+        if image_key:
+            # 图片文件
+            try:
+                img_path = await feishu.download_image(message_id, image_key)
+                text = f"[用户发送了一张图片，路径：{img_path}，请读取并分析这张图片，直接回复用中文]"
+            except Exception as e:
+                print(f"[error] 媒体图片下载失败: {e}", flush=True)
+                text = f"[用户发送了一张图片但下载失败: {e}]"
+        elif file_key and file_name:
+            # 尝试通过 lark-cli 导出文档内容
+            print(f"[媒体] file_key={file_key} file_name={file_name}", flush=True)
+            lark_cli = shutil.which("lark-cli") or "lark-cli"
+            doc_content = ""
+            try:
+                # 先尝试用 docs +fetch（传 token 即可，无需拼接完整 URL）
+                proc = await asyncio.create_subprocess_exec(
+                    lark_cli, "docs", "+fetch",
+                    "--doc", file_key,
+                    "--as", "user",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await proc.communicate()
+                if proc.returncode == 0 and stdout:
+                    data = json.loads(stdout.decode())
+                    raw_content = data.get("data", data)
+                    title = raw_content.get("title", "") if isinstance(raw_content, dict) else ""
+                    body = raw_content.get("content", "") if isinstance(raw_content, dict) else str(raw_content)
+                    doc_content = body
+                    if title:
+                        text = f"[用户分享了文档《{title}》，以下是文档内容：]\n{doc_content}"
+                    else:
+                        text = f"[用户分享了文档，以下是文档内容：]\n{doc_content}"
+            except Exception as e:
+                print(f"[媒体] docs fetch 失败: {e}", flush=True)
+
+            if not doc_content:
+                # 尝试用 drive export
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        lark_cli, "drive", "+export",
+                        "--token", file_key,
+                        "--doc-type", "docx",
+                        "--file-extension", "markdown",
+                        "--as", "user",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    stdout, _ = await proc.communicate()
+                    if proc.returncode == 0:
+                        # export 返回文件路径信息
+                        text = f"[用户分享了文件「{file_name}」，请使用 lark-cli drive +export --token {file_key} --doc-type docx --file-extension markdown 导出后读取]"
+                    else:
+                        text = f"[用户分享了文件「{file_name}」(file_key={file_key})，但无法自动获取内容]"
+                except Exception as e:
+                    print(f"[媒体] drive export 失败: {e}", flush=True)
+                    text = f"[用户分享了文件「{file_name}」(file_key={file_key})]"
+        elif file_key:
+            text = f"[用户分享了一个文件 (file_key={file_key})]"
+        else:
+            print(f"[跳过] media 消息无可用 file_key/image_key", flush=True)
+            return
+
+    elif msg_type in ("file", "audio"):
+        # 文件消息（PDF、Word 等）和语音消息：下载到本地后交给 Claude
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except Exception:
+                pass
+        file_key = content.get("file_key", "") if isinstance(content, dict) else ""
+        file_name = content.get("file_name", "") if isinstance(content, dict) else ""
+        duration = content.get("duration", 0) if isinstance(content, dict) else 0
+
+        if not file_key:
+            print(f"[跳过] {msg_type} 消息无 file_key", flush=True)
+            return
+
+        label = "语音" if msg_type == "audio" else "文件"
+        print(f"[{label}] file_key={file_key} file_name={file_name}" + (f" duration={duration}s" if duration else ""), flush=True)
+
+        # 用 im +messages-resources-download 下载（output 需相对路径）
+        ext = os.path.splitext(file_name)[1] or (".ogg" if msg_type == "audio" else ".bin")
+        safe_name = f"feishu-{msg_type}-{uuid.uuid4().hex[:8]}{ext}"
+        download_to = os.path.join(tempfile.gettempdir(), safe_name)
+
+        try:
+            lark_cli = shutil.which("lark-cli") or "lark-cli"
+            args = [
+                lark_cli, "im", "+messages-resources-download",
+                "--message-id", message_id,
+                "--file-key", file_key,
+                "--type", "file",
+                "--output", safe_name,
+                "--as", "user",
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                cwd=tempfile.gettempdir(),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+
+            # 检查是否实际下载成功
+            actual_path = download_to
+            if proc.returncode == 0:
+                # 可能文件名被修改（server Content-Disposition），尝试找到刚下载的文件
+                out_text = stdout.decode() if stdout else ""
+                if os.path.exists(download_to):
+                    pass  # 用我们预期的路径
+                else:
+                    # 可能在当前目录下有不同的扩展名
+                    import glob as _glob
+                    candidates = _glob.glob(os.path.join(tempfile.gettempdir(), f"feishu-{msg_type}-*"))
+                    if candidates:
+                        # 取最新的
+                        actual_path = max(candidates, key=os.path.getmtime)
+
+            if os.path.exists(actual_path):
+                size_kb = os.path.getsize(actual_path) / 1024
+                print(f"[{label}] 下载成功 → {actual_path} ({size_kb:.0f}KB)", flush=True)
+                if msg_type == "audio":
+                    text = f"[用户发来一段语音（时长 {duration} 秒），已下载到：{actual_path}。当前无法直接转写语音，请告知用户。]"
+                else:
+                    text = f"[用户发送了文件「{file_name}」，已下载到：{actual_path}，请读取并分析这个文件]"
+            else:
+                err = stderr.decode()[:300] if stderr else f"exit={proc.returncode}"
+                print(f"[{label}] 下载后找不到文件: {err}", flush=True)
+                text = f"[用户发送了文件「{file_name}」(file_key={file_key})，但下载后找不到文件：{err}]"
+        except Exception as e:
+            print(f"[{label}] 下载异常: {e}", flush=True)
+            text = f"[用户发送了文件「{file_name}」(file_key={file_key})，但下载异常：{e}]"
+
+    elif msg_type == "media":
+        # 文件/文档附件：提取 file_key 并尝试下载/导出
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except Exception:
+                pass
+        file_key = content.get("file_key", "") if isinstance(content, dict) else ""
+        file_name = content.get("file_name", "") if isinstance(content, dict) else ""
+        image_key = content.get("image_key", "") if isinstance(content, dict) else ""
+
+        if image_key:
+            try:
+                img_path = await feishu.download_image(message_id, image_key)
+                text = f"[用户发送了一张图片，路径：{img_path}，请读取并分析这张图片，直接回复用中文]"
+            except Exception as e:
+                print(f"[error] 媒体图片下载失败: {e}", flush=True)
+                text = f"[用户发送了一张图片但下载失败: {e}]"
+        elif file_key and file_name:
+            print(f"[媒体] file_key={file_key} file_name={file_name}", flush=True)
+            lark_cli = shutil.which("lark-cli") or "lark-cli"
+            doc_content = ""
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    lark_cli, "docs", "+fetch",
+                    "--doc", file_key,
+                    "--as", "user",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await proc.communicate()
+                if proc.returncode == 0 and stdout:
+                    data = json.loads(stdout.decode())
+                    raw_content = data.get("data", data)
+                    title = raw_content.get("title", "") if isinstance(raw_content, dict) else ""
+                    body = raw_content.get("content", "") if isinstance(raw_content, dict) else str(raw_content)
+                    doc_content = body
+                    if title:
+                        text = f"[用户分享了文档《{title}》，以下是文档内容：]\n{doc_content}"
+                    else:
+                        text = f"[用户分享了文档，以下是文档内容：]\n{doc_content}"
+            except Exception as e:
+                print(f"[媒体] docs fetch 失败: {e}", flush=True)
+
+            if not doc_content:
+                try:
+                    text = f"[用户分享了文件「{file_name}」，请使用 lark-cli drive +export --token {file_key} --doc-type docx --file-extension markdown 导出后读取]"
+                except Exception as e:
+                    print(f"[媒体] 处理失败: {e}", flush=True)
+                    text = f"[用户分享了文件「{file_name}」(file_key={file_key})]"
+        elif file_key:
+            text = f"[用户分享了一个文件 (file_key={file_key})]"
+        else:
+            print(f"[跳过] media 消息无可用 file_key/image_key", flush=True)
+            return
+
     else:
         print(f"[跳过] 不支持的消息类型: {msg_type}", flush=True)
         return
+
+    # ── 飞书文档链接预解析 → 用 lark-cli 取内容嵌入上下文 ─────
+    if text:
+        text = await _resolve_feishu_doc_urls(text)
 
     # ── 斜杠命令 ──────────────────────────────────────────────
     parsed = parse_command(text)
@@ -523,7 +786,7 @@ async def handle_doc_comment_from_cli(evt: dict):
         _handled_comment_ids.clear()
 
     try:
-        lark_cli = shutil.which("lark-cli") or "/usr/local/bin/lark-cli"
+        lark_cli = shutil.which("lark-cli") or "lark-cli"
 
         # 1. 获取评论内容（包括划词内容）
         proc = await asyncio.create_subprocess_exec(
@@ -786,12 +1049,17 @@ async def _run_and_display(
     active_run = _active_runs.start_run(user_id, card_msg_id, chat_id=chat_id)
 
     accumulated = ""
+    last_pushed_len = 0
     tool_history: list[str] = []
     ask_options: list[tuple[str, str]] = []
     plan_exited = False
     last_push_time = 0.0
     push_failures = 0
-    _PUSH_INTERVAL = 0.4
+    switched_to_doc = False
+    _DOC_SWITCH_THRESHOLD = 200   # 超过此字数自动切文档
+    _MIN_CHUNK = 80               # 新增 80 字才推
+    _MIN_INTERVAL = 0.3           # 最小间隔，不轰炸 API
+    _MAX_INTERVAL = 0.8           # 最大间隔，保证不卡住
     _MAX_STREAM_DISPLAY = 2500
 
     async def push(content: str):
@@ -809,7 +1077,7 @@ async def _run_and_display(
         parts = []
         if tool_history:
             parts.append("\n".join(tool_history[-5:]))
-        if accumulated:
+        if accumulated and not switched_to_doc:
             if parts:
                 parts.append("")
             d = accumulated
@@ -851,16 +1119,36 @@ async def _run_and_display(
             tool_history[-1] = tool_line
         else:
             tool_history.append(tool_line)
-        await push(_build_display())
+        if switched_to_doc:
+            await push(f"📄 正在生成文档...\n{tool_line}")
+        else:
+            await push(_build_display())
         last_push_time = time.time()
 
     async def on_text_chunk(chunk: str):
-        nonlocal accumulated, last_push_time
+        nonlocal accumulated, last_push_time, last_pushed_len, switched_to_doc
         accumulated += chunk
         now = time.time()
-        if now - last_push_time >= _PUSH_INTERVAL:
+        elapsed = now - last_push_time
+
+        if not switched_to_doc and len(accumulated) >= _DOC_SWITCH_THRESHOLD:
+            switched_to_doc = True
+            await push(f"📄 内容较长（{len(accumulated)} 字），正在生成文档...")
+            last_push_time = now
+            last_pushed_len = len(accumulated)
+            return
+
+        if switched_to_doc:
+            if elapsed >= 3.0:
+                await push(f"📄 正在生成文档...（已 {len(accumulated)} 字）")
+                last_push_time = now
+            return
+
+        new_chars = len(accumulated) - last_pushed_len
+        if (new_chars >= _MIN_CHUNK and elapsed >= _MIN_INTERVAL) or (elapsed >= _MAX_INTERVAL and new_chars > 0):
             await push(_build_display())
             last_push_time = now
+            last_pushed_len = len(accumulated)
 
     try:
         print(f"[run_claude] 开始调用...", flush=True)
@@ -891,6 +1179,44 @@ async def _run_and_display(
     final = full_text or accumulated or "（无输出）"
     if used_fresh_session_fallback:
         final = "⚠️ 检测到工作目录已变化，旧会话无法继续。本次已自动切换到新 session。\n\n" + final
+
+    # ── 文档模式：内容较长，自动写入飞书文档 ────────────────
+    if switched_to_doc and final and len(final) > _DOC_SWITCH_THRESHOLD:
+        doc_url = None
+        try:
+            title_src = text.strip().split("\n")[0][:60]
+            doc_title = f"Claude: {title_src}"
+            lark_cli = shutil.which("lark-cli") or "lark-cli"
+            proc = await asyncio.create_subprocess_exec(
+                lark_cli, "docs", "+create",
+                "--api-version", "v2",
+                "--title", doc_title,
+                "--content", final,
+                "--as", "user",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                result = json.loads(stdout.decode())
+                doc_url = result.get("data", {}).get("document", {}).get("url", "")
+            else:
+                print(f"[doc] 创建失败: {stderr.decode()[:300]}", flush=True)
+        except Exception as e:
+            print(f"[doc] 创建异常: {type(e).__name__}: {e}", flush=True)
+
+        if doc_url:
+            summary = f"📄 文档已生成：\n\n[点击查看]({doc_url})\n\n（共 {len(final)} 字符）"
+            try:
+                await feishu.update_card(card_msg_id, summary)
+            except Exception:
+                pass
+            if new_session_id:
+                await store.on_claude_response(user_id, chat_id, new_session_id, text)
+            return
+        print(f"[doc] 回退为卡片显示", flush=True)
+
+    # ── 正常卡片显示（短回复 / doc 创建失败回退）───────────
     options = _extract_options(final) or ask_options
     try:
         if options:
@@ -1050,7 +1376,7 @@ def _pick_instinct_reaction(user_text: str) -> str:
 async def _add_reaction(message_id: str, emoji_type: str):
     """给消息添加表情 reaction"""
     proc = await asyncio.create_subprocess_exec(
-        shutil.which("lark-cli") or "/usr/local/bin/lark-cli",
+        shutil.which("lark-cli") or "lark-cli",
         "im", "reactions", "create",
         "--params", json.dumps({"message_id": message_id}),
         "--data", json.dumps({"reaction_type": {"emoji_type": emoji_type}}),
@@ -1222,44 +1548,47 @@ def _kill_process_tree(proc):
     alive, blocking new connections. Using process groups ensures we kill
     everything.
     """
-    import signal
-    pgid = None
-    try:
-        pgid = os.getpgid(proc.pid)
-    except (ProcessLookupError, OSError):
-        pass
-
-    # First try graceful SIGTERM to the whole group
-    if pgid is not None:
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            pass
-
-    # Give it 2 seconds to exit gracefully
-    try:
-        proc.wait(timeout=2)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-
-    # Force kill the entire process group
-    if pgid is not None:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except (ProcessLookupError, OSError):
-            pass
+    import platform
+    if platform.system() == "Windows":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            capture_output=True,
+        )
     else:
-        # Fallback: kill just the process if we couldn't get the group
+        import signal
+        pgid = None
         try:
-            proc.kill()
-        except (ProcessLookupError, OSError):
+            pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, OSError, AttributeError):
             pass
 
-    try:
-        proc.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        pass
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+
+        try:
+            proc.wait(timeout=2)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+        else:
+            try:
+                proc.kill()
+            except (ProcessLookupError, OSError):
+                pass
+
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 async def run_lark_cli_loop():
@@ -1271,9 +1600,7 @@ async def run_lark_cli_loop():
       can kill the entire tree (Node.js parent + children) cleanly
     - Cleanup uses process group kill instead of fragile pgrep pattern matching
     """
-    lark_cli = "/usr/local/bin/lark-cli"
-    if not os.path.exists(lark_cli):
-        lark_cli = shutil.which("lark-cli") or "lark-cli"
+    lark_cli = shutil.which("lark-cli") or "lark-cli"
     cmd = [
         lark_cli, "event", "+subscribe",
         "--as", "bot",
@@ -1297,6 +1624,7 @@ async def run_lark_cli_loop():
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
             )
 
             # 专用线程读 stderr：打印日志 + 检测连接断开时立即杀进程触发重连
@@ -1304,7 +1632,7 @@ async def run_lark_cli_loop():
                 try:
                     for line in proc.stderr:
                         line = line.strip()
-                        if not line or "SDK Info" in line:
+                        if not line or "SDK Info" in line or "not found handler" in line:
                             continue
                         print(f"[lark-cli stderr] {line}", flush=True)
                         if "connection reset" in line.lower() or "broken pipe" in line.lower():
@@ -1354,28 +1682,37 @@ def _cleanup_stale_processes():
     the bridge itself crashed and restarted, leaving orphans with no
     parent to clean them up.
     """
-    import signal
+    import platform
     try:
-        result = subprocess.run(
-            ["pgrep", "-f", "lark-cli.*event.*subscribe"],
-            capture_output=True, text=True
-        )
-        pids = [p.strip() for p in result.stdout.strip().split("\n") if p.strip()]
-        if pids:
-            for pid in pids:
-                try:
-                    pid_int = int(pid)
-                    # Try to kill the entire process group first
+        if platform.system() == "Windows":
+            result = subprocess.run(
+                ["taskkill", "/F", "/IM", "lark-cli.exe"],
+                capture_output=True, text=True,
+            )
+            killed_count = result.stdout.count("SUCCESS") + result.stdout.count("成功")
+            if killed_count > 0:
+                print(f"   清理旧进程  : 已杀掉 {killed_count} 个 lark-cli 残留进程", flush=True)
+                time.sleep(3)
+        else:
+            import signal
+            result = subprocess.run(
+                ["pgrep", "-f", "lark-cli.*event.*subscribe"],
+                capture_output=True, text=True
+            )
+            pids = [p.strip() for p in result.stdout.strip().split("\n") if p.strip()]
+            if pids:
+                for pid in pids:
                     try:
-                        pgid = os.getpgid(pid_int)
-                        os.killpg(pgid, signal.SIGKILL)
-                    except (ProcessLookupError, OSError):
-                        # Fallback to individual process kill
-                        os.kill(pid_int, signal.SIGKILL)
-                except (ProcessLookupError, ValueError, OSError):
-                    pass
-            print(f"   清理旧进程  : 已杀掉 {len(pids)} 个 lark-cli 残留进程", flush=True)
-            time.sleep(3)  # Wait for Feishu server to release the WebSocket slot
+                        pid_int = int(pid)
+                        try:
+                            pgid = os.getpgid(pid_int)
+                            os.killpg(pgid, signal.SIGKILL)
+                        except (ProcessLookupError, OSError):
+                            os.kill(pid_int, signal.SIGKILL)
+                    except (ProcessLookupError, ValueError, OSError):
+                        pass
+                print(f"   清理旧进程  : 已杀掉 {len(pids)} 个 lark-cli 残留进程", flush=True)
+                time.sleep(3)
     except Exception:
         pass
 

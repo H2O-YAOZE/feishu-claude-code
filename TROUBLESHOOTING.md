@@ -3,60 +3,101 @@
 ## 机器人"连着但不回消息"
 
 ### 症状
-
 - 飞书里给机器人发消息，完全没反应
-- 日志里明明有 `✅ 事件订阅已连接`，看起来连上了
-- 但永远没有 `[收到消息]` 这一行事件到达
-- Watchdog 每 10 分钟重启一次连接，重启后还是同样症状
+- 日志里显示 `✅ 事件订阅已连接`
+- 但没有 `[收到消息]` 日志
+- 只有 `im.message.reaction.created_v1, not found handler`（这条无害，可忽略）
 
-### 根因：配置被别的 skill 悄悄覆盖了
-
-Bridge 的架构有一个隐形依赖：
-
-- **发消息**走 Python SDK，读的是项目里的 `.env`
-- **收消息**走 `lark-cli` 子进程，默认读的是**全局** `~/.lark-cli/config.json`
-
-这台 Mac 上装了一堆 lark-\* skill（lark-mail、lark-minutes、lark-doc、lark-base 等等），它们**共用同一个**全局配置文件。谁最后写谁就赢。如果某个 skill 把这份配置改成了另一个飞书 App 的凭证，bridge 的 lark-cli 子进程跟着订阅了那个 App 的事件，但你的机器人绑在**另一个 App** 上，消息就永远到不了 bridge。
-
-**打个比方：** 你家装了两部电话，一部（Python SDK）专门拨出去，一部（lark-cli）专门接听。室友（别的 skill）把接听这部电话的号码改了，别人再打你家旧号码进来，那边永远没人接。你自己拨出去还正常，因为那部电话号码没被动。
-
-### 已做的修复
-
-1. bridge 直接共用全局配置 `~/.lark-cli/config.json`（里面存的就是 Zara's CC 的 App 凭证，appSecret 走 keychain 更安全）
-2. `main.py` 的 `lark-cli event +subscribe` 加了 `--force` 参数，启动时强制接管飞书后端的 WebSocket 槽位，避免崩溃残留的幽灵连接吃掉事件
-
-> 注意：既然共用全局配置，如果某天你在别的 lark-\* skill 里切换了身份或换了 App，bridge 会跟着变。真要再出现"收不到消息"，先确认这份配置没被别的 skill 改掉。
-
-### 下次自己怎么诊断
-
-症状一样（连着但收不到），按顺序跑这两步：
+### 诊断步骤（按顺序）
 
 ```bash
-# 1. 全局配置现在配的 App ID 是哪个？
-lark-cli config show | grep appId
+# 1. 检查进程是否在跑
+# Windows:
+tasklist | findstr python
+# macOS/Linux:
+ps aux | grep "main.py"
 
-# 2. 和 .env 里的 FEISHU_APP_ID 比对，必须完全一致
-grep FEISHU_APP_ID "/Users/bytedance/Documents/Claude code projects/feishu-claude-code/.env"
+# 2. 检查日志看连接状态
+tail -20 bridge.log
+
+# 3. 验证 App Secret 是否有效（在 bridge 目录执行）
+python -c "from dotenv import load_dotenv; import os,json,ssl,urllib.request
+load_dotenv()
+app_id = os.environ['FEISHU_APP_ID']
+app_secret = os.environ['FEISHU_APP_SECRET']
+body = json.dumps({'app_id': app_id, 'app_secret': app_secret}).encode()
+req = urllib.request.Request('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', data=body, headers={'Content-Type':'application/json'}, method='POST')
+with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=10) as r:
+    print(json.loads(r.read()))"
+# 期望输出 code=0。如果是 code=10014 (app secret invalid)，需要从飞书开放平台获取新 Secret
+
+# 4. 检查 App ID 一致
+grep FEISHU_APP_ID .env
+lark-cli config show | grep appId
+# 两者必须一致
 ```
 
-App ID 对不上，就是配置被别的 skill 覆盖了。**修复方式：** 用 `lark-cli auth login` 重新登录到 Zara's CC 那个 App。
+## Windows 特有故障
 
-如果 App ID 都对得上但还是收不到，可能的下一层问题：
+### 启动时报 `AttributeError: module 'os' has no attribute 'getpgid'`
+根因：`os.getpgid()` / `os.killpg()` 仅限 Unix，Windows 不支持。
+已修：`_kill_process_tree()` 和 `_cleanup_stale_processes()` 已适配 Windows（使用 `taskkill`）。
 
-- 飞书开放平台那边 `im.message.receive_v1` 事件订阅被取消了
-- 机器人被管理员禁用或权限被撤销
-- App Secret 过期或被刷新（需要重新从开放平台获取并更新两份配置）
+### 日志出现 `UnicodeDecodeError: 'gbk' codec can't decode`
+根因：subprocess 管道在 Windows 上默认用 GBK 编码，但 lark-cli 输出 UTF-8。
+已修：`Popen()` 调用显式指定 `encoding="utf-8"`。
 
-### 重启命令速查
+### 僵尸 lark-cli.exe 占 WebSocket 槽位
+症状：bridge 重连后收不到消息。
+清理：
+```cmd
+taskkill /F /IM lark-cli.exe
+taskkill /F /IM python.exe
+:: 然后重新启动 bridge
+```
+
+### 每次启动需要 clear __pycache__
+如果修改代码后不生效，清理 Python 字节码缓存：
+```bash
+rm -rf __pycache__
+```
+
+## macOS 特有故障
+
+### 配置被别的 skill 覆盖
+Bridge 收消息走 lark-cli 子进程，读全局 `~/.lark-cli/config.json`。如果别的 lark-* skill 改了这份配置的 App ID，bridge 收不到消息。
 
 ```bash
-# 完全重启（改了 plist 之后必须这样，kickstart 不会重载环境变量）
+# 检查全局配置的 App ID
+lark-cli config show | grep appId
+# 与 .env 里的 FEISHU_APP_ID 对比
+grep FEISHU_APP_ID .env
+```
+
+### 重启命令
+```bash
+# 完全重启（用 launchd）
 launchctl unload ~/Library/LaunchAgents/com.zara.feishu-claude.plist
 launchctl load ~/Library/LaunchAgents/com.zara.feishu-claude.plist
 
-# 快速踢一脚（没改配置、只是进程卡住了）
+# 快速踢一脚
 launchctl kickstart -k gui/$(id -u)/com.zara.feishu-claude
 
 # 看日志
-tail -f "/Users/bytedance/Documents/Claude code projects/feishu-claude-code/stdout.log"
+tail -f stdout.log
 ```
+
+## 消息收到了但不回
+
+日志出现 `[error] 发送占位卡片失败: app secret invalid`：
+- `.env` 里的 `FEISHU_APP_SECRET` 过期或错误
+- 从飞书开放平台 → 应用 `cli_xxxxxxxxxxxxxxxx` → 凭证与基础信息 获取新 Secret
+- 更新 `.env` 后重启 bridge
+
+## 重启后收不到第二第三条消息
+
+可能是 lark-cli 子进程的 WebSocket slot 被旧连接占用：
+1. 清除所有残留进程（见上方对应平台）
+2. 清除 `__pycache__`
+3. 重新启动 bridge
+4. 等日志输出 `✅ 事件订阅已连接` 再发消息

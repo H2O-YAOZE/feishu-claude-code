@@ -77,7 +77,7 @@ async def run_claude(
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd or os.path.expanduser("~"),
             env=env,
-            limit=10 * 1024 * 1024,
+            limit=100 * 1024 * 1024,  # 100MB，防止大文档工具结果溢出单行限制
         )
 
         await _fire_callback(on_process_start, proc)
@@ -103,6 +103,9 @@ async def run_claude(
                     raise RuntimeError(
                         f"Claude 执行超时（{IDLE_TIMEOUT}秒无输出），已终止进程"
                     )
+                except (ValueError, asyncio.exceptions.LimitOverrunError):
+                    # 单行超过缓冲区限制（例如大文件工具结果），跳过该行继续读
+                    continue
 
                 if not raw_line:  # EOF
                     break

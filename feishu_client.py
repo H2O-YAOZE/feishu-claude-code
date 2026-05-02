@@ -32,54 +32,40 @@ def _card_json(content: str, loading: bool = False) -> str:
     if loading:
         elements.append({"tag": "markdown", "content": "⏳ 思考中..."})
     else:
-        # 飞书 markdown 元素长度限制约 3000 字符，保守使用 2800
         MAX_CHUNK_SIZE = 2800
 
         if len(content) <= MAX_CHUNK_SIZE:
-            # 内容不长，直接发送
             elements.append({"tag": "markdown", "content": content})
         else:
-            # 内容过长，分段发送
-            # 尝试按段落分割，避免在句子中间截断
             chunks = []
             current_chunk = ""
 
-            # 按换行符分割
             lines = content.split('\n')
 
             for line in lines:
-                # 如果单行就超过限制，强制截断
                 if len(line) > MAX_CHUNK_SIZE:
-                    # 先保存当前块
                     if current_chunk:
                         chunks.append(current_chunk)
                         current_chunk = ""
 
-                    # 强制分割长行
                     for i in range(0, len(line), MAX_CHUNK_SIZE):
                         chunks.append(line[i:i + MAX_CHUNK_SIZE])
                     continue
 
-                # 检查加上这行是否会超过限制
                 if len(current_chunk) + len(line) + 1 > MAX_CHUNK_SIZE:
-                    # 超过限制，保存当前块，开始新块
                     if current_chunk:
                         chunks.append(current_chunk)
                     current_chunk = line
                 else:
-                    # 未超过限制，追加到当前块
                     if current_chunk:
                         current_chunk += '\n' + line
                     else:
                         current_chunk = line
 
-            # 保存最后一块
             if current_chunk:
                 chunks.append(current_chunk)
 
-            # 为每个块创建 markdown 元素
             for i, chunk in enumerate(chunks):
-                # 第一块不加前缀，后续块加分段标记
                 if i > 0:
                     chunk = f"**（续 {i}）**\n\n{chunk}"
                 elements.append({"tag": "markdown", "content": chunk})
