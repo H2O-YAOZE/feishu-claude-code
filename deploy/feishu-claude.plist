@@ -9,18 +9,18 @@
     <array>
         <string>/usr/local/bin/python3</string>
         <string>-u</string>
-        <string>/Users/bytedance/Documents/Claude code projects/feishu-claude-code/main.py</string>
+        <string>REPO_PATH/main.py</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/bytedance/Documents/Claude code projects/feishu-claude-code</string>
+    <string>REPO_PATH</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Users/bytedance/.npm-global/bin:/Users/bytedance/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <string>HOME_PATH/.npm-global/bin:HOME_PATH/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
         <key>HOME</key>
-        <string>/Users/bytedance</string>
+        <string>HOME_PATH</string>
         <key>PYTHONUNBUFFERED</key>
         <string>1</string>
     </dict>
@@ -35,8 +35,8 @@
     <integer>10</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/bytedance/Documents/Claude code projects/feishu-claude-code/stdout.log</string>
+    <string>REPO_PATH/stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/bytedance/Documents/Claude code projects/feishu-claude-code/stderr.log</string>
+    <string>REPO_PATH/stderr.log</string>
 </dict>
 </plist>

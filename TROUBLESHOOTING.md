@@ -91,7 +91,7 @@ tail -f stdout.log
 
 日志出现 `[error] 发送占位卡片失败: app secret invalid`：
 - `.env` 里的 `FEISHU_APP_SECRET` 过期或错误
-- 从飞书开放平台 → 应用 `cli_xxxxxxxxxxxxxxxx` → 凭证与基础信息 获取新 Secret
+- 从飞书开放平台 → 你的应用 → 凭证与基础信息 获取新 Secret
 - 更新 `.env` 后重启 bridge
 
 ## 重启后收不到第二第三条消息

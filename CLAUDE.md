@@ -61,15 +61,3 @@ deploy/           # macOS launchd plist
 TROUBLESHOOTING.md # 故障排查
 ```
 
-## 飞书文件发送流程（跨项目约定）
-
-当用户说"发文件到飞书"：
-
-1. **上传到中转站** `lark-cli drive +upload --file <path> --folder-token xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`
-2. **复制到存档** `lark-cli drive +copy --file-token <token> --folder-token xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`
-3. **通知用户** `lark-cli im +messages-send --user-id ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx --text "文件已上传：<link> ｜ 存档：<archive_link>"`
-
-关键 Token：
-- 中转站（临时）：`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`
-- 存档（永久）：`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`
-- 用户 open_id：`ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`

@@ -91,8 +91,8 @@
 ### 2. 安装
 
 ```bash
-git clone https://github.com/zarazhangrui/feishu-claudecode-bridge.git
-cd feishu-claudecode-bridge
+git clone https://github.com/Constult/feishu-claude-code.git
+cd feishu-claude-code
 
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
@@ -120,7 +120,8 @@ python main.py
 start_bridge.bat
 
 # macOS 后台（launchd 保活）
-cp deploy/feishu-claude.plist ~/Library/LaunchAgents/
+# 先编辑 deploy/feishu-claude.plist：把 REPO_PATH 改为仓库路径，HOME_PATH 改为你的 home 目录
+cp deploy/feishu-claude.plist ~/Library/LaunchAgents/com.zara.feishu-claude.plist
 launchctl load ~/Library/LaunchAgents/com.zara.feishu-claude.plist
 ```
 
