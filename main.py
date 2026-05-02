@@ -1190,22 +1190,31 @@ async def _run_and_display(
             if not doc_token:
                 raise RuntimeError("no document_id in response")
 
-            # Step 2: 写入内容
-            proc = await asyncio.create_subprocess_exec(
-                lark_cli, "docs", "+update",
-                "--api-version", "v2",
-                "--command", "overwrite",
-                "--doc-format", "markdown",
-                "--doc", doc_token,
-                "--content", final,
-                "--as", "user",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                print(f"[doc] 写入内容失败: {stderr.decode()[:300]}", flush=True)
-                # 文档壳已创建，仍然返回链接
+            # Step 2: 写入内容（临时文件，避免 shell 截断特殊字符）
+            tmp_name = f"_feishu_doc_{uuid.uuid4().hex[:8]}.md"
+            tmp_path = os.path.join(os.getcwd(), tmp_name)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(final)
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    lark_cli, "docs", "+update",
+                    "--api-version", "v2",
+                    "--command", "overwrite",
+                    "--doc-format", "markdown",
+                    "--doc", doc_token,
+                    "--content", f"@{tmp_name}",
+                    "--as", "user",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await proc.communicate()
+                if proc.returncode != 0:
+                    print(f"[doc] 写入内容失败: {stderr.decode()[:300]}", flush=True)
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
             print(f"[doc] 文档已生成: {doc_url}", flush=True)
         except Exception as e:
             doc_url = None
