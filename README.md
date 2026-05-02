@@ -1,8 +1,8 @@
 # feishu-claude-code
 
-在飞书里实时对话 Claude Code。WebSocket 长连接，流式卡片输出，手机上随时 code review、debug、问问题。
+> 飞书是遥控器，Claude Code 是在你电脑上真实干活的那只手。出门在外发一条飞书消息，电脑那边就开始跑代码、改文件、读文档。
 
-> 复用 Claude Max/Pro 订阅，不需要 API Key，不需要公网 IP。
+复用 Claude Max/Pro 订阅，不需要 API Key，不需要公网 IP。
 
 ## 与同类项目的差异
 
