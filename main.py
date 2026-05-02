@@ -1166,25 +1166,49 @@ async def _run_and_display(
     if switched_to_doc and final and len(final) > _DOC_SWITCH_THRESHOLD:
         doc_url = None
         try:
-            title_src = text.strip().split("\n")[0][:60]
-            doc_title = f"Claude: {title_src}"
+            title_src = text.strip().split("\n")[0][:50]
             lark_cli = shutil.which("lark-cli") or "lark-cli"
+
+            # Step 1: 创建文档壳
             proc = await asyncio.create_subprocess_exec(
                 lark_cli, "docs", "+create",
                 "--api-version", "v2",
-                "--title", doc_title,
-                "--content", final,
+                "--content", f"# {title_src}",
+                "--doc-format", "markdown",
                 "--as", "user",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await proc.communicate()
-            if proc.returncode == 0:
-                result = json.loads(stdout.decode())
-                doc_url = result.get("data", {}).get("document", {}).get("url", "")
-            else:
-                print(f"[doc] 创建失败: {stderr.decode()[:300]}", flush=True)
+            if proc.returncode != 0:
+                print(f"[doc] 创建壳失败: {stderr.decode()[:300]}", flush=True)
+                raise RuntimeError("create shell failed")
+
+            result = json.loads(stdout.decode())
+            doc_url = result.get("data", {}).get("document", {}).get("url", "")
+            doc_token = result.get("data", {}).get("document", {}).get("document_id", "")
+            if not doc_token:
+                raise RuntimeError("no document_id in response")
+
+            # Step 2: 写入内容
+            proc = await asyncio.create_subprocess_exec(
+                lark_cli, "docs", "+update",
+                "--api-version", "v2",
+                "--command", "overwrite",
+                "--doc-format", "markdown",
+                "--doc", doc_token,
+                "--content", final,
+                "--as", "user",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                print(f"[doc] 写入内容失败: {stderr.decode()[:300]}", flush=True)
+                # 文档壳已创建，仍然返回链接
+            print(f"[doc] 文档已生成: {doc_url}", flush=True)
         except Exception as e:
+            doc_url = None
             print(f"[doc] 创建异常: {type(e).__name__}: {e}", flush=True)
 
         if doc_url:
