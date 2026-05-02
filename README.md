@@ -101,7 +101,7 @@
 ### 2. 安装
 
 ```bash
-git clone https://github.com/Constult/feishu-claude-code.git
+git clone https://github.com/H2O-YAOZE/feishu-claude-code.git
 cd feishu-claude-code
 
 python -m venv .venv
