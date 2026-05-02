@@ -743,7 +743,7 @@ async def _process_message_cli(user_id, chat_id, is_group, msg_type, content, me
             pass
         return
 
-    await _run_and_display(user_id, chat_id, is_group, text, card_msg_id, session, message_id)
+    await _run_and_display(user_id, chat_id, is_group, text, card_msg_id, session, message_id, raw_oc_chat_id)
 
 
 # ── 卡片按钮回调处理 ─────────────────────────────────────────
@@ -1044,8 +1044,9 @@ async def handle_card_action_from_cli(evt: dict):
 async def _run_and_display(
     user_id: str, chat_id: str, is_group: bool,
     text: str, card_msg_id: str, session, notify_msg_id: str,
+    raw_oc_chat_id: str = "",
 ):
-    """调用 Claude 并流式展示结果，检测选项时附加按钮。"""
+    """调用 Claude 并流式展示结果。超过阈值自动切换为文档输出。支持 [[SEND_FILE]] 文件回传。"""
     active_run = _active_runs.start_run(user_id, card_msg_id, chat_id=chat_id)
 
     accumulated = ""
@@ -1179,6 +1180,43 @@ async def _run_and_display(
     final = full_text or accumulated or "（无输出）"
     if used_fresh_session_fallback:
         final = "⚠️ 检测到工作目录已变化，旧会话无法继续。本次已自动切换到新 session。\n\n" + final
+
+    # ── [[SEND_FILE]] 文件回传 ───────────────────────────────
+    _SEND_FILE_RE = re.compile(r'\[\[SEND_FILE:(.+?)\]\]')
+    send_matches = list(_SEND_FILE_RE.finditer(final))
+    if send_matches:
+        lark_cli = shutil.which("lark-cli") or "lark-cli"
+        for m in reversed(send_matches):
+            filepath = m.group(1).strip()
+            full_path = os.path.expanduser(filepath)
+            if not os.path.isabs(full_path):
+                full_path = os.path.abspath(full_path)
+            if not os.path.exists(full_path):
+                final = final[:m.start()] + f"❌ 文件不存在：{filepath}" + final[m.end():]
+                continue
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    lark_cli, "drive", "+upload",
+                    "--file", full_path,
+                    "--as", "user",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await proc.communicate()
+                if proc.returncode == 0:
+                    result = json.loads(stdout.decode())
+                    file_data = result.get("data", result)
+                    file_url = file_data.get("url", "") or file_data.get("share_link", "")
+                    file_name = os.path.basename(full_path)
+                    if file_url:
+                        final = final[:m.start()] + f"📎 [{file_name}]({file_url})" + final[m.end():]
+                    else:
+                        final = final[:m.start()] + f"✅ {file_name} 已上传" + final[m.end():]
+                else:
+                    err = stderr.decode()[:100] if stderr else f"exit={proc.returncode}"
+                    final = final[:m.start()] + f"❌ 上传失败：{err}" + final[m.end():]
+            except Exception as e:
+                final = final[:m.start()] + f"❌ 上传异常：{e}" + final[m.end():]
 
     # ── 文档模式：内容较长，自动写入飞书文档 ────────────────
     if switched_to_doc and final and len(final) > _DOC_SWITCH_THRESHOLD:
