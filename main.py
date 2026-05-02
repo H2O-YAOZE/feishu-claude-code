@@ -1001,7 +1001,7 @@ async def _run_and_display(
     last_push_time = 0.0
     push_failures = 0
     switched_to_doc = False
-    _DOC_SWITCH_THRESHOLD = 200   # 超过此字数自动切文档
+    _DOC_SWITCH_THRESHOLD = 50    # 超过此字数自动切文档
     _MIN_CHUNK = 80               # 新增 80 字才推
     _MIN_INTERVAL = 0.3           # 最小间隔，不轰炸 API
     _MAX_INTERVAL = 0.8           # 最大间隔，保证不卡住
