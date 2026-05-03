@@ -1735,6 +1735,9 @@ def _cleanup_stale_processes():
 
 
 def main():
+    # Reconfigure stdout for Windows GBK terminals that can't handle emoji
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     print("🚀 飞书 Claude Bot 启动中...")
     print(f"   App ID      : {config.FEISHU_APP_ID}")
     print(f"   默认模型    : {config.DEFAULT_MODEL}")
