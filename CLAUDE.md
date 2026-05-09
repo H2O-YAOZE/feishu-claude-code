@@ -22,9 +22,9 @@ main.py ──事件分发──→ handle_message_from_cli()
 
 ## 关键约束
 
-- **平台**：代码已适配 Windows 和 macOS，但进程清理方式不同（Windows 用 taskkill，macOS 用 os.killpg）
+- **平台**：代码已适配 Windows 和 macOS。进程清理先尝试优雅关闭（关 stdin 等 3s 让 lark-cli 发 unsubscribe），超时才强杀（Windows: taskkill /F，macOS: os.killpg(SIGKILL)）
 - **Secret 双份**：lark-cli 读全局 `~/.lark-cli/config.json`（收消息），Python SDK 读项目 `.env`（发消息）。两份 App ID 必须一致，Secret 分别存储在系统凭据管理器和 .env 中
-- **文档操作走 lark-cli**：消息中包含飞书文档链接（docx/wiki/docs/sheets/base/mindnotes/minutes/file）时，bridge 自动用 `lark-cli docs +fetch --as user` 获取文档内容并嵌入上下文，避免 Claude 自己用 WebFetch 访问导致权限报错。media 消息类型（直接分享文档附件）同理走 lark-cli
+- **文档操作走 lark-cli**：消息中包含飞书文档链接（docx/wiki/docs/sheets/base/mindnotes/file）时，bridge 自动用 `lark-cli docs +fetch --as user` 获取文档内容并嵌入上下文。**妙记（minutes）例外**：走 `lark-cli vc +notes --minute-tokens <token>` 获取逐字稿+AI 总结+章节。media 消息类型（直接分享文档附件）同理走 lark-cli。所需 scope：`vc:note:read` `minutes:minutes:readonly` `minutes:minutes.artifacts:read` `minutes:minutes.transcript:export`
 - **文件回传 [[SEND_FILE]]**：Claude 在回复中输出 `[[SEND_FILE:路径]]` 时，bridge 自动将文件上传到飞书 Drive 并替换为下载链接，支持相对/绝对路径，任意文件类型
 - **不要改 .env**：`.env` 在 `.gitignore` 里，不要提交
 - **改代码后清缓存**：`rm -rf __pycache__`，否则 Python 可能跑旧的 .pyc

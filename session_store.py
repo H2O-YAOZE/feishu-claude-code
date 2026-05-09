@@ -10,6 +10,20 @@ from typing import Optional
 
 from bot_config import SESSIONS_DIR, DEFAULT_MODEL, DEFAULT_CWD, PERMISSION_MODE
 
+def _safe_create_task(coro, name=""):
+    """创建 asyncio task 并记录未处理异常"""
+    task = asyncio.create_task(coro)
+    def _on_done(t):
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc:
+            label = f" [{name}]" if name else ""
+            print(f"[session_store] task{label} 异常: {type(exc).__name__}: {exc}", flush=True)
+    task.add_done_callback(_on_done)
+    return task
+
+
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 
 
@@ -474,7 +488,7 @@ class SessionStore:
             # 异步生成摘要，不阻塞消息流
             summaries = self._data[user_id].get("summaries", {})
             if not summaries.get(old_id):
-                asyncio.create_task(self._bg_generate_summary(user_id, old_id))
+                _safe_create_task(self._bg_generate_summary(user_id, old_id), name="summary")
 
         cur["session_id"] = new_session_id
         if not cur.get("preview"):
@@ -502,7 +516,7 @@ class SessionStore:
             summaries = self._data[user_id].get("summaries", {})
             old_title = summaries.get(old_id, "")
             if not old_title:
-                asyncio.create_task(self._bg_generate_summary(user_id, old_id))
+                _safe_create_task(self._bg_generate_summary(user_id, old_id), name="summary")
 
         # Create new session
         chat_data["current"] = {

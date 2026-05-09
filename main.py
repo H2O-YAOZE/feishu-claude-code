@@ -266,32 +266,109 @@ async def _resolve_feishu_doc_urls(text: str, is_group: bool = False) -> str:
 
     for full_url in unique_urls[:3]:
         try:
-            proc = await asyncio.create_subprocess_exec(
-                lark_cli, "docs", "+fetch",
-                "--doc", full_url,
-                "--as", "user",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode == 0 and stdout:
-                data = json.loads(stdout.decode())
-                raw_content = data.get("data", data)
-                title = raw_content.get("title", "") if isinstance(raw_content, dict) else ""
-                body = raw_content.get("content", "") if isinstance(raw_content, dict) else str(raw_content)
-                if title and body:
-                    doc_parts.append(f"[文档《{title}》]\n{body}")
-                elif body:
-                    doc_parts.append(f"[文档内容]\n{body}")
+            # 妙记类型走 vc +notes，不走废弃的 docs +fetch
+            if "/minutes/" in full_url:
+                doc_parts.append(await _resolve_minutes_url(lark_cli, full_url))
             else:
-                err_msg = stderr.decode()[:200] if stderr else f"exit={proc.returncode}"
-                print(f"[文档解析] 获取失败 {full_url}: {err_msg}", flush=True)
+                doc_parts.append(await _resolve_doc_url(lark_cli, full_url))
         except Exception as e:
             print(f"[文档解析] 异常 {full_url}: {e}", flush=True)
 
+    doc_parts = [p for p in doc_parts if p]
     if doc_parts:
         return text + "\n\n---\n" + "\n---\n".join(doc_parts)
     return text
+
+
+async def _resolve_minutes_url(lark_cli: str, full_url: str) -> str | None:
+    """通过 vc +notes 获取妙记的文字内容（逐字稿、总结、章节）"""
+    token = full_url.rstrip("/").split("/")[-1]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            lark_cli, "vc", "+notes",
+            "--minute-tokens", token,
+            "--as", "user",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode == 0 and stdout:
+            data = json.loads(stdout.decode())
+            notes = data.get("data", {}).get("notes", [])
+            if notes and "error" not in notes[0]:
+                note = notes[0]
+                title = note.get("title", "")
+                artifacts = note.get("artifacts", {})
+                parts = []
+                if title:
+                    parts.append(f"[妙记《{title}》]")
+                summary = artifacts.get("summary", "")
+                if summary:
+                    parts.append(f"【AI 总结】\n{summary}")
+                chapters = artifacts.get("chapters", [])
+                if chapters:
+                    chapter_lines = ["【章节】"]
+                    for ch in chapters:
+                        ts = int(ch.get("start_ms", 0)) / 1000
+                        mins, secs = int(ts // 60), int(ts % 60)
+                        chapter_lines.append(f"  {mins}:{secs:02d}  {ch.get('title', '')}")
+                    parts.append("\n".join(chapter_lines))
+                transcript_file = artifacts.get("transcript_file", "")
+                if transcript_file:
+                    try:
+                        # transcript_file 是相对路径，如 minutes/<token>/transcript.txt
+                        local_path = os.path.join(os.path.dirname(__file__), transcript_file)
+                        with open(local_path, "r", encoding="utf-8") as f:
+                            transcript = f.read()
+                        # 取逐字稿正文（去掉头部元信息行）
+                        lines = transcript.strip().split("\n")
+                        body_start = 0
+                        for i, line in enumerate(lines):
+                            if line.startswith("说话人"):
+                                body_start = i
+                                break
+                        if body_start > 0:
+                            parts.append("【逐字稿】\n" + "\n".join(lines[body_start:]))
+                    except Exception as e:
+                        print(f"[文档解析] 读取妙记逐字稿失败: {e}", flush=True)
+                return "\n\n".join(parts) if parts else None
+            else:
+                err = notes[0].get("error", "unknown") if notes else "no notes"
+                print(f"[文档解析] 获取妙记失败 {full_url}: {err}", flush=True)
+        else:
+            err_msg = stderr.decode()[:200] if stderr else f"exit={proc.returncode}"
+            print(f"[文档解析] 获取妙记失败 {full_url}: {err_msg}", flush=True)
+    except Exception as e:
+        print(f"[文档解析] 妙记异常 {full_url}: {e}", flush=True)
+    return None
+
+
+async def _resolve_doc_url(lark_cli: str, full_url: str) -> str | None:
+    """通过 docs +fetch 获取文档内容"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            lark_cli, "docs", "+fetch",
+            "--doc", full_url,
+            "--as", "user",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode == 0 and stdout:
+            data = json.loads(stdout.decode())
+            raw_content = data.get("data", data)
+            title = raw_content.get("title", "") if isinstance(raw_content, dict) else ""
+            body = raw_content.get("content", "") if isinstance(raw_content, dict) else str(raw_content)
+            if title and body:
+                return f"[文档《{title}》]\n{body}"
+            elif body:
+                return f"[文档内容]\n{body}"
+        else:
+            err_msg = stderr.decode()[:200] if stderr else f"exit={proc.returncode}"
+            print(f"[文档解析] 获取失败 {full_url}: {err_msg}", flush=True)
+    except Exception as e:
+        print(f"[文档解析] 异常 {full_url}: {e}", flush=True)
+    return None
 
 
 async def _process_message_cli(user_id, chat_id, is_group, msg_type, content, message_id, mentions, raw_oc_chat_id=""):
@@ -808,7 +885,7 @@ async def handle_doc_comment_from_cli(evt: dict):
         print(f"[文档评论] 已回复评论 {comment_id}", flush=True)
 
         # 4. 启动后台轮询：监听这条评论的后续回复（无需 @）
-        asyncio.create_task(_poll_comment_replies(
+        _safe_create_task(_poll_comment_replies(
             lark_cli, file_token, file_type or "docx", comment_id, user_id
         ))
 
@@ -1257,7 +1334,7 @@ async def _run_and_display(
     if new_session_id:
         await store.on_claude_response(user_id, chat_id, new_session_id, text)
 
-    if plan_exited and session.permission_mode == "plan":
+    if plan_exited and (await store.get_current(user_id, chat_id)).permission_mode == "plan":
         print(f"[Plan] ExitPlanMode 检测到，切换为 bypassPermissions", flush=True)
         await store.set_permission_mode(user_id, chat_id, "bypassPermissions")
         try:
@@ -1479,11 +1556,18 @@ def _handle_task_exception(task):
 
 # ── lark-cli 事件循环 ────────────────────────────────────────
 
-async def _event_reader(proc):
+async def _event_reader(proc, failures=None):
     """从 lark-cli 的 stdout 读取 NDJSON 事件并分发处理
 
     Uses a dedicated thread to read stdout line-by-line (blocking I/O),
     then feeds lines into an asyncio.Queue for the main event loop to process.
+
+    Returns one of: "idle" (no events for IDLE_TIMEOUT), "wake" (sleep resume),
+    "eof" (stdout closed), "error" (reader thread crashed).
+
+    Post-connect: first event must arrive within POST_CONNECT_TIMEOUT (120s)
+    or the connection is considered silently dead and triggers a reconnect.
+    After the first event, switches to the normal IDLE_TIMEOUT (600s).
     """
     queue = asyncio.Queue()
     main_loop = asyncio.get_event_loop()
@@ -1496,8 +1580,6 @@ async def _event_reader(proc):
                 if line:
                     main_loop.call_soon_threadsafe(queue.put_nowait, line)
         except Exception as e:
-            # Log the error so we know WHY the reader thread died
-            # (previously this was `pass`, which hid crashes silently)
             print(f"[lark-cli reader] thread error: {type(e).__name__}: {e}", flush=True)
         # stdout closed (process exited or pipe broken) → send sentinel
         main_loop.call_soon_threadsafe(queue.put_nowait, None)
@@ -1505,37 +1587,38 @@ async def _event_reader(proc):
     reader = threading.Thread(target=_reader_thread, daemon=True)
     reader.start()
 
-    # 固定 10 分钟空闲超时：笔记本睡醒后最多等 10 分钟 bot 就能恢复响应。
-    # 比之前 2 小时的自适应超时激进得多，但能确保用户体验。
-    # lark-cli 内部会发 WebSocket ping，所以连接正常时不会触发这个超时。
     _last_event_in_reader = time.time()
     IDLE_TIMEOUT = 600
+    POST_CONNECT_TIMEOUT = 120
+    _first_event_received = False
 
     while True:
-        # 每次最多等 5 秒，好让我们及时响应 _wake_event（休眠唤醒信号）
         try:
             line = await asyncio.wait_for(queue.get(), timeout=5.0)
         except asyncio.TimeoutError:
             # 先看 watchdog 是否提示机器刚醒
             if _wake_event.is_set():
                 _wake_event.clear()
-                print(f"[lark-cli] 🌅 收到唤醒信号，主动断开重连", flush=True)
+                print(f"[lark-cli] 收到唤醒信号，主动断开重连", flush=True)
                 _kill_process_tree(proc)
-                break
-            # 再看是否真的静默太久
+                return "wake"
             idle_seconds = time.time() - _last_event_in_reader
-            if idle_seconds > IDLE_TIMEOUT:
-                print(f"[lark-cli] ⚠️ {idle_seconds/60:.0f}分钟无事件，重启连接", flush=True)
+            # 连接后首条事件的超时更短（120s），用于检测静默死连接
+            effective_timeout = POST_CONNECT_TIMEOUT if not _first_event_received else IDLE_TIMEOUT
+            if idle_seconds > effective_timeout:
+                reason = "post_connect" if not _first_event_received else "idle"
+                print(f"[lark-cli] {idle_seconds/60:.0f}分钟无事件({reason})，重启连接", flush=True)
                 _kill_process_tree(proc)
-                break
+                return reason
             continue
 
         if line is None:
             exit_code = proc.poll()
             print(f"[lark-cli] stdout EOF, exit_code={exit_code}, 准备重连...", flush=True)
-            break
+            return "eof"
 
         _last_event_in_reader = time.time()
+        _first_event_received = True
 
         try:
             evt = json.loads(line)
@@ -1558,14 +1641,34 @@ async def _event_reader(proc):
 
 
 def _kill_process_tree(proc):
-    """Kill a subprocess and ALL its children by process group.
+    """Kill a subprocess and ALL its children.
 
-    lark-cli (Node.js) spawns child processes internally. If we only kill
-    the parent, the children become orphans and keep the WebSocket connection
-    alive, blocking new connections. Using process groups ensures we kill
-    everything.
+    Tries graceful shutdown first (close stdin → lark-cli sends unsubscribe →
+    closes WebSocket cleanly), then falls back to force kill after a timeout.
+    This prevents server-side subscription leakage that happens when we
+    force-kill without giving the process a chance to unsubscribe.
+
+    Safe to call with proc=None (no-op).
     """
+    if proc is None:
+        return
     import platform
+
+    # Step 1: close stdin to signal graceful shutdown (lark-cli treats stdin EOF as shutdown)
+    try:
+        if proc.stdin:
+            proc.stdin.close()
+    except Exception:
+        pass
+
+    # Step 2: wait briefly for graceful exit
+    try:
+        proc.wait(timeout=3)
+        return  # exited cleanly
+    except subprocess.TimeoutExpired:
+        pass
+
+    # Step 3: force kill the process tree
     if platform.system() == "Windows":
         subprocess.run(
             ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
@@ -1616,7 +1719,9 @@ async def run_lark_cli_loop():
     - Spawns lark-cli in its own process group (start_new_session=True) so we
       can kill the entire tree (Node.js parent + children) cleanly
     - Cleanup uses process group kill instead of fragile pgrep pattern matching
+    - Exponential backoff on repeated failures (10s → 20s → 40s → ... → max 120s)
     """
+    import random
     lark_cli = shutil.which("lark-cli") or "lark-cli"
     cmd = [
         lark_cli, "event", "+subscribe",
@@ -1626,25 +1731,30 @@ async def run_lark_cli_loop():
         "--event-types", "im.message.receive_v1,card.action.trigger,drive.notice.comment_add_v1",
     ]
 
-    _consecutive_failures = 0
+    failures = [0]  # mutable so _event_reader / stderr_reader can increment via closure
 
     while True:
-        # Kill any leftover lark-cli subscribe processes from previous crashes.
-        # This is a safety net — normally _kill_process_tree handles cleanup,
-        # but if the bridge itself crashed and restarted, orphans may exist.
         await asyncio.to_thread(_cleanup_stale_processes)
 
         print("[lark-cli] 启动事件订阅...", flush=True)
+        proc = None
+        reason = "eof"  # default if Popen itself fails
         try:
             proc = subprocess.Popen(
                 cmd,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
             )
 
-            # 专用线程读 stderr：打印日志 + 检测连接断开时立即杀进程触发重连
+            # ── stderr reader：日志 + 断开检测 ──────────────
+            _disconnect_keywords = (
+                "connection reset", "broken pipe", "connection was aborted",
+                "wsarecv", "no such host", "i/o timeout", "unexpected eof",
+                "use of closed network connection",
+            )
             def _stderr_reader():
                 try:
                     for line in proc.stderr:
@@ -1652,8 +1762,10 @@ async def run_lark_cli_loop():
                         if not line or "SDK Info" in line or "not found handler" in line:
                             continue
                         print(f"[lark-cli stderr] {line}", flush=True)
-                        if "connection reset" in line.lower() or "broken pipe" in line.lower():
+                        lower = line.lower()
+                        if any(kw in lower for kw in _disconnect_keywords):
                             print("[lark-cli] ⚠️ 检测到连接断开，立即重启", flush=True)
+                            failures[0] += 1
                             _kill_process_tree(proc)
                             return
                 except Exception as e:
@@ -1663,28 +1775,35 @@ async def run_lark_cli_loop():
             # 等一下看有没有立即报错（进程直接退出）
             await asyncio.sleep(3)
             if proc.poll() is not None:
-                _consecutive_failures += 1
-                wait_time = min(10 * _consecutive_failures, 120)
-                print(f"[lark-cli] 启动失败 (exit={proc.returncode})，{wait_time}秒后重试 (第{_consecutive_failures}次)", flush=True)
-                await asyncio.sleep(wait_time)
+                failures[0] += 1
+                wait = min(10 * (2 ** min(failures[0], 4)), 120)
+                wait += random.randint(0, int(wait * 0.3))
+                print(f"[lark-cli] 启动失败 (exit={proc.returncode})，{wait}s 后重试 (第{failures[0]}次)", flush=True)
+                await asyncio.sleep(wait)
                 continue
 
-            _consecutive_failures = 0
             print("[lark-cli] ✅ 事件订阅已连接", flush=True)
-            await _event_reader(proc)
+            failures[0] = 0  # 成功连接后重置失败计数
+            reason = await _event_reader(proc, failures)
 
         except Exception as e:
+            failures[0] += 1
             print(f"[lark-cli] 异常: {type(e).__name__}: {e}", flush=True)
             traceback.print_exc(file=sys.stdout)
             sys.stdout.flush()
+            reason = "exception"
 
-        # Clean up the process tree (not just the parent!) before reconnecting.
-        # This is the critical fix: without process group kill, Node.js children
-        # survive and hold the WebSocket connection open, causing the next
-        # lark-cli instance to either be rejected or lose events.
         _kill_process_tree(proc)
-        print("[lark-cli] 10秒后重连...", flush=True)
-        await asyncio.sleep(10)
+
+        # idle / post_connect / wake 是正常连接维护，用短固定延迟
+        # eof / exception / 启动失败 才是真正的异常，用指数退避
+        if reason in ("idle", "post_connect", "wake"):
+            wait = 10 + random.randint(0, 5)
+        else:
+            wait = min(10 * (2 ** min(failures[0], 4)), 120)
+            wait += random.randint(0, int(wait * 0.3))
+        print(f"[lark-cli] {wait}s 后重连... (reason={reason}, failures={failures[0]})", flush=True)
+        await asyncio.sleep(wait)
 
 
 # ── 启动 ──────────────────────────────────────────────────────

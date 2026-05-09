@@ -49,7 +49,11 @@ lark-cli config show | grep appId
 
 ### 僵尸 lark-cli.exe 占 WebSocket 槽位
 症状：bridge 重连后收不到消息。
-清理：
+
+**自动化清理**：bridge 重启时会自动 `taskkill /F /IM lark-cli.exe` 清理残留进程，正常情况无需手动操作。
+重连时先尝试优雅关闭（关 stdin → lark-cli 发 unsubscribe → 清理服务端订阅），超时 3s 后才强杀。
+
+如果自动清理失败，手动清理：
 ```cmd
 taskkill /F /IM lark-cli.exe
 taskkill /F /IM python.exe
@@ -93,6 +97,14 @@ tail -f stdout.log
 - `.env` 里的 `FEISHU_APP_SECRET` 过期或错误
 - 从飞书开放平台 → 你的应用 → 凭证与基础信息 获取新 Secret
 - 更新 `.env` 后重启 bridge
+
+## 日志里频繁看到"X分钟无事件，重启连接"
+
+这是**正常行为**，不是故障：
+- bridge 每 10 分钟无消息会主动重连（防止笔记本休眠后连接僵死）
+- 日志格式：`[lark-cli] 10分钟无事件(idle)，重启连接` → `13s 后重连... (reason=idle, failures=0)`
+- 空闲重连用固定 10-15s 短延迟，不会影响消息接收
+- 只有真正的网络故障才会触发指数退避（`reason=eof/exception`）
 
 ## 重启后收不到第二第三条消息
 
