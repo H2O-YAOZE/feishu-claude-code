@@ -36,6 +36,7 @@ from run_control import ActiveRun, ActiveRunRegistry, stop_run
 _start_time = time.time()
 _last_event = time.time()
 _wake_event = threading.Event()  # 被设置时，事件循环立即杀掉 WebSocket 连接触发重连
+_reconnect_pending = False  # 任务运行期间有重连需求时置为 True，任务结束后 flush
 
 
 def _watchdog():
@@ -56,9 +57,13 @@ def _watchdog():
         last_tick = now
 
         if drift > 60:
-            # wall-clock 突然跳了超过 1 分钟 → 机器刚从睡眠里醒来
-            print(f"[watchdog] 🌅 检测到休眠唤醒 (drift={drift:.0f}s)，强制重连 WebSocket", flush=True)
-            _wake_event.set()
+            if _has_active_runs():
+                global _reconnect_pending
+                _reconnect_pending = True
+                print(f"[watchdog] 🌅 休眠唤醒 (drift={drift:.0f}s)，任务活跃，延迟重连", flush=True)
+            else:
+                print(f"[watchdog] 🌅 检测到休眠唤醒 (drift={drift:.0f}s)，强制重连 WebSocket", flush=True)
+                _wake_event.set()
 
         uptime = now - _start_time
         idle = now - _last_event
@@ -79,6 +84,15 @@ lark_client = lark.Client.builder() \
 feishu = FeishuClient(lark_client, app_id=config.FEISHU_APP_ID, app_secret=config.FEISHU_APP_SECRET)
 store = SessionStore()
 _active_runs = ActiveRunRegistry()
+
+
+def _has_active_runs() -> bool:
+    """判断是否还有任务在跑。失败时保守返回 True，避免误杀订阅。"""
+    try:
+        return _active_runs.count_active() > 0
+    except Exception:
+        return True
+
 
 # per-chat 消息队列锁，保证同一群组的消息串行处理，允许不同群组并发处理
 _chat_locks: dict[str, asyncio.Lock] = {}
@@ -1080,10 +1094,10 @@ async def _run_and_display(
     last_push_time = 0.0
     push_failures = 0
     switched_to_doc = False
-    _DOC_SWITCH_THRESHOLD = 50    # 超过此字数自动切文档
+    _DOC_SWITCH_THRESHOLD = 30    # 超过此字数自动切文档（降低阈值，更快切文档模式）
     _MIN_CHUNK = 80               # 新增 80 字才推
-    _MIN_INTERVAL = 0.3           # 最小间隔，不轰炸 API
-    _MAX_INTERVAL = 0.8           # 最大间隔，保证不卡住
+    _MIN_INTERVAL = 0.8           # 最小间隔，不轰炸 API（适配慢模型）
+    _MAX_INTERVAL = 2.0           # 最大间隔，保证不卡住（适配慢模型）
     _MAX_STREAM_DISPLAY = 2500
 
     async def push(content: str):
@@ -1199,6 +1213,12 @@ async def _run_and_display(
         return
     finally:
         _active_runs.clear_run(user_id, active_run, chat_id=chat_id)
+        # 任务结束后，如果有待处理的重连需求则触发
+        global _reconnect_pending
+        if _reconnect_pending and not _has_active_runs():
+            _reconnect_pending = False
+            print("[reconnect] 任务结束，执行延迟重连", flush=True)
+            _wake_event.set()
 
     final = full_text or accumulated or "（无输出）"
     if used_fresh_session_fallback:
@@ -1559,16 +1579,10 @@ def _handle_task_exception(task):
 async def _event_reader(proc, failures=None):
     """从 lark-cli 的 stdout 读取 NDJSON 事件并分发处理
 
-    Uses a dedicated thread to read stdout line-by-line (blocking I/O),
-    then feeds lines into an asyncio.Queue for the main event loop to process.
-
-    Returns one of: "idle" (no events for IDLE_TIMEOUT), "wake" (sleep resume),
-    "eof" (stdout closed), "error" (reader thread crashed).
-
-    Post-connect: first event must arrive within POST_CONNECT_TIMEOUT (120s)
-    or the connection is considered silently dead and triggers a reconnect.
-    After the first event, switches to the normal IDLE_TIMEOUT (600s).
+    Returns one of: "idle" (no events for IDLE_TIMEOUT 600s), "wake" (sleep resume),
+    "eof" (stdout closed).
     """
+    global _reconnect_pending
     queue = asyncio.Queue()
     main_loop = asyncio.get_event_loop()
 
@@ -1589,8 +1603,6 @@ async def _event_reader(proc, failures=None):
 
     _last_event_in_reader = time.time()
     IDLE_TIMEOUT = 600
-    POST_CONNECT_TIMEOUT = 120
-    _first_event_received = False
 
     while True:
         try:
@@ -1599,17 +1611,24 @@ async def _event_reader(proc, failures=None):
             # 先看 watchdog 是否提示机器刚醒
             if _wake_event.is_set():
                 _wake_event.clear()
+                if _has_active_runs():
+                    _reconnect_pending = True
+                    _last_event_in_reader = time.time()
+                    print("[lark-cli] wake 信号延迟（任务活跃），待任务结束后重连", flush=True)
+                    continue
                 print(f"[lark-cli] 收到唤醒信号，主动断开重连", flush=True)
                 _kill_process_tree(proc)
                 return "wake"
             idle_seconds = time.time() - _last_event_in_reader
-            # 连接后首条事件的超时更短（120s），用于检测静默死连接
-            effective_timeout = POST_CONNECT_TIMEOUT if not _first_event_received else IDLE_TIMEOUT
-            if idle_seconds > effective_timeout:
-                reason = "post_connect" if not _first_event_received else "idle"
-                print(f"[lark-cli] {idle_seconds/60:.0f}分钟无事件({reason})，重启连接", flush=True)
+            if idle_seconds > IDLE_TIMEOUT:
+                if _has_active_runs():
+                    _reconnect_pending = True
+                    _last_event_in_reader = time.time()
+                    print(f"[lark-cli] {idle_seconds/60:.0f}分钟无事件，任务活跃，延迟重连", flush=True)
+                    continue
+                print(f"[lark-cli] {idle_seconds/60:.0f}分钟无事件(idle)，重启连接", flush=True)
                 _kill_process_tree(proc)
-                return reason
+                return "idle"
             continue
 
         if line is None:
@@ -1618,7 +1637,6 @@ async def _event_reader(proc, failures=None):
             return "eof"
 
         _last_event_in_reader = time.time()
-        _first_event_received = True
 
         try:
             evt = json.loads(line)
@@ -1726,7 +1744,6 @@ async def run_lark_cli_loop():
     cmd = [
         lark_cli, "event", "+subscribe",
         "--as", "bot",
-        "--quiet",
         "--force",
         "--event-types", "im.message.receive_v1,card.action.trigger,drive.notice.comment_add_v1",
     ]
@@ -1795,9 +1812,9 @@ async def run_lark_cli_loop():
 
         _kill_process_tree(proc)
 
-        # idle / post_connect / wake 是正常连接维护，用短固定延迟
+        # idle / wake 是正常连接维护，用短固定延迟
         # eof / exception / 启动失败 才是真正的异常，用指数退避
-        if reason in ("idle", "post_connect", "wake"):
+        if reason in ("idle", "wake"):
             wait = 10 + random.randint(0, 5)
         else:
             wait = min(10 * (2 ** min(failures[0], 4)), 120)

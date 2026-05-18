@@ -46,6 +46,15 @@ class ActiveRunRegistry:
             return
         self._runs.pop(key, None)
 
+    def has_active(self, chat_id: Optional[str] = None) -> bool:
+        if chat_id:
+            run = self._runs.get(chat_id)
+            return bool(run and not run.stop_requested)
+        return any(not run.stop_requested for run in self._runs.values())
+
+    def count_active(self) -> int:
+        return sum(1 for run in self._runs.values() if not run.stop_requested)
+
 
 async def _maybe_await(result):
     if asyncio.iscoroutine(result):

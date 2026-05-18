@@ -67,8 +67,11 @@ async def run_claude(
             cmd += ["--dangerously-skip-permissions", "--permission-mode", "bypassPermissions"]
         if active_session_id:
             cmd += ["--resume", active_session_id]
-        if model:
-            cmd += ["--model", model]
+        # 优先用环境变量 ANTHROPIC_MODEL（全局配置），不传 --model 覆盖
+        # 只有当环境变量没设时才用传入的 model 作为兜底
+        effective_model = model if not os.environ.get("ANTHROPIC_MODEL") else None
+        if effective_model:
+            cmd += ["--model", effective_model]
 
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)
